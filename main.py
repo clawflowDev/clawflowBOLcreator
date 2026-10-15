@@ -12,7 +12,7 @@ import cloudinary
 import cloudinary.uploader
 import os
 
-app = FastAPI(title="CLAWFLOW BOL/POD Cloudinary Engine", version="2.0")
+app = FastAPI(title="CLAWFLOW BOL/POD Cloudinary Engine", version="2.1")
 
 # Configurar Cloudinary usando las variables de entorno de Render
 cloudinary.config(
@@ -31,25 +31,23 @@ def health_check():
 
 def process_document_with_cloudinary(image_bytes: bytes) -> Image.Image:
     """
-    Sube la imagen a Cloudinary y aplica transformaciones automáticas de calidad profesional
-    (mejora de iluminación, alto contraste, nitidez y conversión a grises limpia).
+    Sube la imagen a Cloudinary y aplica transformaciones de nivel 'CamScanner'
+    (blanqueo total de fondo, eliminación de sombras y realce de tinta negra).
     """
     try:
-        print("-> Subiendo documento a Cloudinary...")
-        # Subir los bytes de la imagen directamente a Cloudinary
+        print("-> Subiendo documento a Cloudinary para efecto escáner...")
+        # Subir los bytes de la imagen aplicando el perfil de documento de alta definición
         upload_result = cloudinary.uploader.upload(
             image_bytes,
             transformation=[
-                {"effect": "improve"},                    # Corrige iluminación general y sombras
-                {"effect": "contrast:60"},                 # Blanquea el fondo y oscurece las letras
-                {"effect": "sharpen:100"},                # Nitidez milimétrica al texto y firmas
-                {"effect": "grayscale"},                  # Pasa a escala de grises limpia profesional
+                {"effect": "blackwhite:threshold:65"},     # Binarización agresiva: limpia el fondo gris a blanco puro y oscurece la tinta
+                {"effect": "sharpen:150"},                # Nitidez extrema para que las letras y firmas no pierdan definición
                 {"fetch_format": "jpg"}
             ]
         )
         
         processed_url = upload_result.get("secure_url")
-        print(f"-> ¡Éxito en Cloudinary! URL procesada: {processed_url}")
+        print(f"-> ¡Éxito en Cloudinary! URL de escáner: {processed_url}")
 
         # Descargar la imagen ya procesada
         resp = requests.get(processed_url, timeout=20)
@@ -60,7 +58,7 @@ def process_document_with_cloudinary(image_bytes: bytes) -> Image.Image:
 
     except Exception as e:
         print(f"❌ ERROR CRÍTICO procesando con Cloudinary: {str(e)}")
-        # Fallback de seguridad local si llegara a fallar la conexión con Cloudinary
+        # Fallback de seguridad local si llegara a fallar la conexión
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         gray = cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY)
@@ -128,7 +126,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF unificado con motor Cloudinary generado exitosamente."
+            "message": "PDF unificado con motor de escáner Cloudinary generado exitosamente."
         }
 
     except HTTPException as he:
