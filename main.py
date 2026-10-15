@@ -10,26 +10,22 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Smart Division Engine", version="12.0")
+app = FastAPI(title="CLAWFLOW Smart Division Engine", version="12.1")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW Smart Division Engine Active"}
+    key_status = "CONFIGURADA (Longitud: " + str(len(GROQ_API_KEY)) + ")" if GROQ_API_KEY else "NO CONFIGURADA ❌"
+    return {"status": "online", "service": "CLAWFLOW Smart Division Engine Active", "groq_key_status": key_status}
 
 def get_document_corners_from_groq(image_bytes: bytes, original_w: int, original_h: int) -> list:
-    """
-    Tarea de Groq Vision: Actuar como los 'ojos' de la arquitectura.
-    Analiza la imagen a color y devuelve únicamente las 4 esquinas exactas 
-    del documento de papel, ignorando el fondo oscuro del asiento.
-    """
     if not GROQ_API_KEY:
-        print("⚠️ Advertencia: GROQ_API_KEY no configurada en Render.")
+        print("🚨 ERROR CRÍTICO: GROQ_API_KEY está vacía en las variables de entorno de Render.")
         return None
 
     try:
-        print("-> [Groq Vision] Analizando esquinas exactas de la hoja a color...")
+        print("-> [Groq Vision] Preparando petición HTTP a Groq...")
         base64_image = base64.b64encode(image_bytes).decode("utf-8")
         
         headers = {
@@ -63,10 +59,15 @@ def get_document_corners_from_groq(image_bytes: bytes, original_w: int, original
         }
 
         response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
-        response.raise_for_status()
         
+        print(f"-> [Groq Vision] Código de respuesta HTTP: {response.status_code}")
+        if response.status_code != 200:
+            print(f"-> [Groq Vision Error Body]: {response.text}")
+            return None
+
         result_json = response.json()
         content = result_json["choices"][0]["message"]["content"].strip()
+        print(f"-> [Groq Vision Raw Response]: {content}")
         
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0].strip()
@@ -82,20 +83,15 @@ def get_document_corners_from_groq(image_bytes: bytes, original_w: int, original
                 x = int((pt[0] / 1000.0) * original_w)
                 y = int((pt[1] / 1000.0) * original_h)
                 pixel_corners.append([x, y])
-            print(f"-> [Groq Vision] Esquinas detectadas con éxito: {pixel_corners}")
+            print(f"-> [Groq Vision] Esquinas convertidas a píxeles: {pixel_corners}")
             return pixel_corners
 
     except Exception as e:
-        print(f"⚠️ Error en Groq Vision: {str(e)}")
+        print(f"🚨 Excepción atrapada en get_document_corners_from_groq: {str(e)}")
 
     return None
 
 def four_point_transform(image, pts):
-    """
-    Tarea de OpenCV (Músculo Local): 
-    Realiza el recorte geométrico exacto y la corrección de perspectiva (warpPerspective) 
-    utilizando las esquinas que le entregó Groq Vision.
-    """
     rect = np.array(pts, dtype="float32")
     (tl, tr, br, bl) = rect
 
@@ -118,13 +114,6 @@ def four_point_transform(image, pts):
     return warped
 
 def process_document_pipeline(image_bytes: bytes) -> Image.Image:
-    """
-    Pipeline Híbrido Sólido:
-    1. Groq Vision obtiene las coordenadas del papel a color.
-    2. OpenCV corta y endereza milimétricamente por perspectiva.
-    3. OpenCV realza el contraste de lectura sobre la imagen limpia.
-    4. Se monta sobre un lienzo blanco corporativo.
-    """
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -134,20 +123,17 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
 
         original_h, original_w = img.shape[:2]
 
-        # Paso 1: Groq Vision detecta las esquinas
         corners = get_document_corners_from_groq(image_bytes, original_w, original_h)
 
         if corners:
-            # Paso 2: OpenCV ejecuta el recorte y enderezamiento de perspectiva perfecto
             warped_doc = four_point_transform(img, corners)
-            print("-> [OpenCV] Recorte y perspectiva aplicados con precisión milimétrica.")
+            print("-> [OpenCV] Recorte de perspectiva aplicado con éxito.")
         else:
-            print("-> [Aviso] Respaldo de seguridad activado por margen perimetral.")
+            print("🚨 [ALERTA] Groq Vision no entregó esquinas. Usando respaldo de emergencia (Margen 4%).")
             margin_y = int(original_h * 0.04)
             margin_x = int(original_w * 0.04)
             warped_doc = img[margin_y:original_h-margin_y, margin_x:original_w-margin_x]
 
-        # Paso 3: Normalización y mejora de contraste inteligente para lectura de datos
         target_width = 1600
         ch, cw = warped_doc.shape[:2]
         if cw > target_width:
@@ -155,7 +141,6 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
             new_h = int(ch * ratio)
             warped_doc = cv2.resize(warped_doc, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        # Realce CLAHE conservando tonos naturales
         lab = cv2.cvtColor(warped_doc, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -165,7 +150,6 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        # Paso 4: Lienzo blanco estándar limpio y profesional
         dw, dh = doc_pil.size
         canvas_w = dw + 60
         canvas_h = dh + 60
@@ -175,7 +159,7 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         return canvas
 
     except Exception as e:
-        print(f"❌ Error crítico en pipeline: {str(e)}")
+        print(f"❌ Error crítico en process_document_pipeline: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -210,9 +194,8 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
-                # REGLA: Horizontal intacta a color; Vertical procesada con el pipeline híbrido inteligente
                 if w > h:
-                    print(f"-> Imagen {index+1}: Carga horizontal detectada. Manteniendo a color.")
+                    print(f"-> Imagen {index+1}: Horizontal. A color.")
                     target_w = 1600
                     if w > target_w:
                         ratio = target_w / float(w)
@@ -220,7 +203,7 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento vertical detectado. Iniciando pipeline inteligente.")
+                    print(f"-> Imagen {index+1}: Vertical. Procesando con Groq Vision.")
                     clean_doc = process_document_pipeline(image_bytes)
                     pil_images.append(clean_doc)
                 
@@ -228,7 +211,7 @@ async def process_bol(payload: BOLRequest):
                 print(f"Advertencia en imagen {index}: {str(img_err)}")
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="Ninguna imagen procesada con éxito.")
+            raise HTTPException(status_code=400, detail="Ninguna imagen procesada.")
 
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
@@ -250,7 +233,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF unificado con arquitectura Smart Division generado exitosamente."
+            "message": "PDF generado con logs de diagnóstico."
         }
 
     except HTTPException as he:
