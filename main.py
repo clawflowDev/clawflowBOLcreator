@@ -7,24 +7,59 @@ from pydantic import BaseModel
 import requests
 import numpy as np
 import cv2
-from PIL import Image, ImageOps
+from PIL import Image
 import os
+import cloudinary
+import cloudinary.uploader
+import cloudinary.utils
 
-app = FastAPI(title="CLAWFLOW Clean Canvas Engine", version="7.0")
+# Configuración automática de Cloudinary desde las variables de entorno de Render
+# Asegúrate de tener configurado CLOUDINARY_URL en tus Environment Variables de Render
+cloudinary.config(secure=True)
+
+app = FastAPI(title="CLAWFLOW Hybrid Archive Engine", version="8.0")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW Clean Canvas Engine Active"}
+    return {"status": "online", "service": "CLAWFLOW Hybrid Engine (Cloudinary Crop + OpenCV Enhancer) Active"}
 
-def process_document_on_clean_canvas(image_bytes: bytes) -> Image.Image:
+def cloudinary_smart_crop_and_upload(image_bytes: bytes) -> bytes:
     """
-    Procesa la imagen para archivo limpio usando un lienzo blanco uniforme:
-    - Realiza el realce de contraste perfecto (CLAHE) para legibilidad óptima.
-    - Coloca la imagen centrada sobre un fondo/lienzo blanco puro estandarizado,
-      eliminando visualmente todo el fondo de asientos, mesas o entornos sin arriesgar texto.
+    Envía la imagen a Cloudinary para que su IA haga el recorte inteligente del documento
+    y elimine los fondos (asientos, mesas), devolviendo la imagen limpia.
     """
     try:
-        print("-> Procesando documento con motor Clean Canvas...")
+        print("-> Enviando imagen a Cloudinary para recorte inteligente...")
+        
+        # Subir la imagen a Cloudinary aplicando transformaciones de recorte automático y detección de bordes
+        # 'e_trim' o 'crop: limit' con optimización de documento
+        upload_result = cloudinary.uploader.upload(
+            image_bytes,
+            transformation=[
+                {"effect": "trim", "f_auto": "true"}, # Recorte automático de bordes por IA de Cloudinary
+                {"quality": "auto"}
+            ]
+        )
+        
+        secure_url = upload_result.get("secure_url")
+        print(f"-> Cloudinary recortó con éxito. URL optimizada: {secure_url}")
+        
+        # Descargar la imagen ya recortada por Cloudinary
+        resp = requests.get(secure_url, timeout=15)
+        resp.raise_for_status()
+        return resp.content
+
+    except Exception as e:
+        print(f"⚠️ Aviso: Cloudinary falló en el recorte ({str(e)}). Usando bytes originales de respaldo.")
+        return image_bytes
+
+def process_document_hybrid(image_bytes: bytes) -> Image.Image:
+    """
+    Fase 2 del Híbrido: Toma la imagen ya recortada por Cloudinary y le aplica
+    el realce de contraste local perfecto con OpenCV.
+    """
+    try:
+        print("-> Aplicando realce de contraste local OpenCV sobre imagen recortada...")
         
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -32,51 +67,28 @@ def process_document_on_clean_canvas(image_bytes: bytes) -> Image.Image:
         if img is None:
             raise ValueError("No se pudo decodificar la imagen.")
 
-        # 1. Redimensionar de forma estándar para mantener uniformidad (ancho base de 1600px)
+        # 1. Redimensionar estándar a 1600px de ancho
         target_width = 1600
         h, w = img.shape[:2]
         if w > target_width:
             ratio = target_width / float(w)
             new_h = int(h * ratio)
-            img_resized = cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            img_resized = img
+            img = cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        # 2. Convertir a escala de grises profesional
-        gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
-        
-        # 3. Contraste equilibrado (CLAHE) para que la lectura sea perfecta y nítida
+        # 2. Escala de grises y CLAHE (el contraste nítido que te gusta)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         
-        # 4. Reducción de ruido sutil
+        # 3. Reducción de ruido sutil
         denoised = cv2.fastNlMeansDenoising(enhanced, h=8, templateWindowSize=7, searchWindowSize=21)
         
-        # Convertir a PIL Image en RGB
-        doc_image = Image.fromarray(denoised).convert("RGB")
-
-        # 5. El toque maestro del Lienzo Blanco (Canvas Padding):
-        # Creamos un lienzo vertical estándar tipo documento limpio (ej: proporción A4 / Carta de 1700x2200 o basado en la foto)
-        doc_w, doc_h = doc_image.size
-        canvas_width = max(doc_w + 100, 1650)   # Margen simétrico a los lados
-        canvas_height = max(doc_h + 100, 2200)  # Margen simétrico arriba y abajo
-        
-        # Crear lienzo completamente blanco puro
-        canvas = Image.new("RGB", (canvas_width, canvas_height), (255, 255, 255))
-        
-        # Calcular posición exacta para centrar la foto del documento en el lienzo
-        offset_x = (canvas_width - doc_w) // 2
-        offset_y = (canvas_height - doc_h) // 2
-        
-        # Pegar el documento en el centro exacto del lienzo blanco
-        canvas.paste(doc_image, (offset_x, offset_y))
-        
-        print("-> ¡Documento unificado y centrado en lienzo blanco con éxito!")
-        return canvas
+        processed_image = Image.fromarray(denoised).convert("RGB")
+        print("-> ¡Proceso híbrido completado con éxito!")
+        return processed_image
 
     except Exception as e:
-        print(f"❌ Error en procesamiento de lienzo: {str(e)}")
-        # Fallback de seguridad
+        print(f"❌ Error en procesamiento híbrido: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -111,7 +123,7 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
-                # REGLA: Carga horizontal se mantiene a color optimizado; Documentos verticales pasan por el motor Clean Canvas
+                # REGLA: Carga horizontal a color optimizado; Documentos verticales pasan por el motor Híbrido (Cloudinary + OpenCV)
                 if w > h:
                     print(f"-> Imagen {index+1}: Carga detectada (Horizontal - {w}x{h}). Optimizando a color.")
                     target_w = 1600
@@ -121,8 +133,11 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Aplicando Clean Canvas.")
-                    clean_doc = process_document_on_clean_canvas(image_bytes)
+                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Iniciando pipeline Híbrido.")
+                    # Paso 1: Recorte inteligente en Cloudinary
+                    cropped_bytes = cloudinary_smart_crop_and_upload(image_bytes)
+                    # Paso 2: Realce estético local con OpenCV
+                    clean_doc = process_document_hybrid(cropped_bytes)
                     pil_images.append(clean_doc)
                 
             except Exception as img_err:
@@ -152,7 +167,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF unificado con motor Clean Canvas generado exitosamente."
+            "message": "PDF unificado con motor Híbrido (Cloudinary + OpenCV) generado exitosamente."
         }
 
     except HTTPException as he:
