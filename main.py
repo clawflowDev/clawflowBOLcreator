@@ -10,11 +10,11 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Classic HF Vision Engine", version="16.0")
+app = FastAPI(title="CLAWFLOW Router HF Vision Engine", version="17.0")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# Modelos en cascada apuntando al endpoint clásico de inferencia
+# Modelos en cascada usando el router oficial de Hugging Face
 VISION_MODELS_CANDIDATES = [
     "meta-llama/Llama-3.2-11B-Vision-Instruct",
     "Qwen/Qwen2-VL-7B-Instruct",
@@ -24,7 +24,7 @@ VISION_MODELS_CANDIDATES = [
 @app.get("/")
 def health_check():
     token_status = "CONFIGURADA (Longitud: " + str(len(HF_TOKEN)) + ")" if HF_TOKEN else "NO CONFIGURADA ❌"
-    return {"status": "online", "service": "CLAWFLOW Classic HF Vision Engine Active", "hf_token_status": token_status}
+    return {"status": "online", "service": "CLAWFLOW Router HF Vision Engine Active", "hf_token_status": token_status}
 
 def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h: int) -> list:
     if not HF_TOKEN:
@@ -37,6 +37,9 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
         "Content-Type": "application/json"
     }
 
+    # Endpoint oficial del router compatible con OpenAI
+    api_url = "https://router.huggingface.co/v1/chat/completions"
+
     prompt_text = (
         "Analiza esta imagen a color y localiza estrictamente los límites del documento de papel (la hoja de Bill of Lading / recibo). "
         "Ignora por completo el fondo oscuro, los asientos, las manos o la mesa. "
@@ -46,61 +49,38 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
 
     for index, model_name in enumerate(VISION_MODELS_CANDIDATES):
         try:
-            print(f"-> [LOG 2.1.{index}] Intentando con endpoint clásico para [{model_name}]...")
+            print(f"-> [LOG 2.1.{index}] Intentando con router oficial para [{model_name}]...")
             
-            # Endpoint clásico de inferencia serverless por modelo
-            api_url = f"https://api-inference.huggingface.co/models/{model_name}"
-
-            # Formato compatible con chat completions de la API clásica
             payload = {
-                "inputs": {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{base64_image}"
-                                    }
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
                                 }
-                            ]
-                        }
-                    ]
-                },
-                "parameters": {
-                    "temperature": 0.0,
-                    "max_new_tokens": 150
-                }
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.0,
+                "max_tokens": 150
             }
 
             response = requests.post(api_url, headers=headers, json=payload, timeout=25)
             
-            print(f"-> [LOG 2.2.{index}] HTTP Status clásico para {model_name}: {response.status_code}")
+            print(f"-> [LOG 2.2.{index}] HTTP Status del router para {model_name}: {response.status_code}")
             if response.status_code != 200:
-                print(f"🚨 [LOG 2.3.{index} ERROR]: {response.text}")
-                print(f"-> [LOG 2.4.{index}] Modelo {model_name} falló. Pasando al siguiente...")
+                print(f"🚨 [LOG 2.3.{index} ERROR BODY]: {response.text}")
+                print(f"-> [LOG 2.4.{index}] Modelo {model_name} falló. Pasando al siguiente en la cadena...")
                 continue
 
-            resp_data = response.json()
-            
-            # Manejar posibles estructuras de respuesta de la API clásica (texto o lista de choices)
-            content = ""
-            if isinstance(resp_data, list) and len(resp_data) > 0:
-                if "generated_text" in resp_data[0]:
-                    content = resp_data[0]["generated_text"]
-                elif "choices" in resp_data[0]:
-                    content = resp_data[0]["choices"][0]["message"]["content"]
-            elif isinstance(resp_data, dict):
-                if "choices" in resp_data:
-                    content = resp_data["choices"][0]["message"]["content"]
-                elif "generated_text" in resp_data:
-                    content = resp_data["generated_text"]
-
-            if not content:
-                content = json.dumps(resp_data)
-
+            result_json = response.json()
+            content = result_json["choices"][0]["message"]["content"].strip()
             print(f"-> [LOG 2.5.{index}] Respuesta obtenida de {model_name}: {content}")
             
             if "```json" in content:
@@ -118,14 +98,14 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
                 pixel_ymax = int((ymax / 1000.0) * original_h)
                 pixel_xmax = int((xmax / 1000.0) * original_w)
                 
-                print(f"-> [LOG 2.6] ¡Éxito con el modelo clásico {model_name}! Coordenadas: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
+                print(f"-> [LOG 2.6] ¡Éxito con el modelo {model_name}! Coordenadas: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
                 return [pixel_ymin, pixel_xmin, pixel_ymax, pixel_xmax]
 
         except Exception as e:
-            print(f"🚨 [LOG 2.7 Excepción con modelo clásico {model_name}]: {str(e)}")
+            print(f"🚨 [LOG 2.7 Excepción con modelo {model_name}]: {str(e)}")
             continue
 
-    print("🚨 [LOG 2.8 ALERTA TOTAL] Todos los modelos clásicos fallaron.")
+    print("🚨 [LOG 2.8 ALERTA TOTAL] Todos los modelos del router fallaron.")
     return None
 
 def process_document_with_hf(image_bytes: bytes) -> Image.Image:
@@ -153,7 +133,7 @@ def process_document_with_hf(image_bytes: bytes) -> Image.Image:
             x2 = min(original_w, xmax - margin_x)
             
             cropped_doc = img[y1:y2, x1:x2]
-            print("-> [LOG 4.2] Recorte milimétrico aplicado con éxito.")
+            print("-> [LOG 4.2] Recorte milimétrico aplicado con éxito usando el router.")
         else:
             print("🚨 [LOG 4.3 ALERTA] Usando respaldo de emergencia (Margen 4%).")
             crop_y = int(original_h * 0.04)
@@ -234,7 +214,7 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> [LOG 5.4] Imagen {index+1} vertical. Enviando a cadena clásica de visión...")
+                    print(f"-> [LOG 5.4] Imagen {index+1} vertical. Enviando al router oficial de visión...")
                     clean_doc = process_document_with_hf(image_bytes)
                     pil_images.append(clean_doc)
                 
@@ -266,7 +246,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado con motor clásico de Hugging Face."
+            "message": "PDF generado utilizando el router oficial de Hugging Face."
         }
 
     except HTTPException as he:
