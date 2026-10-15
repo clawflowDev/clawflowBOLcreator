@@ -10,11 +10,11 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Robust Document Engine", version="9.0")
+app = FastAPI(title="CLAWFLOW Color-Aided Edge Engine", version="9.1")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW Robust Document Engine Active"}
+    return {"status": "online", "service": "CLAWFLOW Color-Aided Edge Engine Active"}
 
 def order_points(pts):
     """Ordena los 4 puntos cardinales de un contorno: superior-izq, superior-der, inferior-der, inferior-izq."""
@@ -50,16 +50,15 @@ def four_point_transform(image, pts):
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def process_document_robust(image_bytes: bytes) -> Image.Image:
+def process_document_color_guided(image_bytes: bytes) -> Image.Image:
     """
-    Motor Robusto Local:
-    1. Detecta la hoja mediante umbral adaptativo y contornos.
-    2. Si halla la hoja, la extrae y endereza con perspectiva.
-    3. Aplica contraste CLAHE nítido para lectura perfecta.
-    4. Si el entorno es muy irregular, enmarca sobre un fondo limpio uniforme.
+    Motor con Detección a Color:
+    1. Analiza los canales de color originales para encontrar los bordes de la hoja sin confundirse con grises.
+    2. Aisla y endereza la perspectiva.
+    3. Realza el texto para máxima legibilidad de archivo.
     """
     try:
-        print("-> Procesando documento con motor robusto local...")
+        print("-> Procesando documento con guía de color para bordes...")
         
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -69,21 +68,25 @@ def process_document_robust(image_bytes: bytes) -> Image.Image:
 
         h, w = img.shape[:2]
         
-        # Redimensionar para procesamiento rápido y estable
+        # Redimensionar para estabilidad
         max_dim = 1600
         if max(h, w) > max_dim:
             scale = max_dim / float(max(h, w))
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             h, w = img.shape[:2]
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Convertir a espacio de color LAB o HSV para potenciar la separación de tonos (Color-based edge detection)
+        # El canal L (Luminancia) combinado con saturación ayuda muchísimo a aislar el papel blanco de asientos oscuros.
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
         
-        # Umbral adaptativo para separar el papel blanco del fondo del asiento/mesa
-        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                     cv2.THRESH_BINARY, 11, 2)
+        # Desenfoque suave para eliminar texturas de la tela del asiento
+        blurred = cv2.GaussianBlur(l_channel, (7, 7), 0)
+        
+        # Umbralización Otsu sobre el canal de luminancia optimizado
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
 
         warped = None
@@ -91,7 +94,7 @@ def process_document_robust(image_bytes: bytes) -> Image.Image:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
             
-            # Si el contorno tiene 4 esquinas y ocupa una porción razonable de la imagen (más del 15%)
+            # Si tiene 4 esquinas y ocupa más del 15% de la imagen
             if len(approx) == 4 and cv2.contourArea(c) > (h * w * 0.15):
                 try:
                     warped = four_point_transform(img, approx.reshape(4, 2))
@@ -99,39 +102,35 @@ def process_document_robust(image_bytes: bytes) -> Image.Image:
                 except Exception:
                     continue
 
-        # Si el motor geométrico logró aislar la hoja con éxito
         if warped is not None and warped.shape[0] > 200 and warped.shape[1] > 200:
-            print("-> ¡Detección geométrica exitosa! Hoja aislada y enderezada.")
+            print("-> ¡Detección guiada por color exitosa! Hoja aislada.")
             target_doc = warped
         else:
-            print("-> Aviso: Detección estricta no concluyente. Aplicando recorte perimetral seguro de respaldo.")
-            # Respaldo seguro: recortar un 6% perimetral para quitar bordes toscos sin morder texto
-            pad_y = int(h * 0.06)
-            pad_x = int(w * 0.06)
+            print("-> Aviso: Detección estricta no concluyente. Aplicando recorte de respaldo seguro.")
+            pad_y = int(h * 0.05)
+            pad_x = int(w * 0.05)
             target_doc = img[pad_y:h-pad_y, pad_x:w-pad_x]
 
-        # Convertir a escala de grises y aplicar el contraste CLAHE perfecto que te gusta
+        # Post-procesamiento enfocado en nitidez de texto manteniendo escala de grises limpia
         gray_doc = cv2.cvtColor(target_doc, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray_doc)
         
-        # Reducción de ruido sutil
         denoised = cv2.fastNlMeansDenoising(enhanced, h=8, templateWindowSize=7, searchWindowSize=21)
-        
         doc_pil = Image.fromarray(denoised).convert("RGB")
 
-        # Lienzo de estandarización final (Padding simétrico elegante para uniformidad en el PDF)
+        # Lienzo de estandarización final (Padding simétrico elegante)
         dw, dh = doc_pil.size
         canvas_w = dw + 80
         canvas_h = dh + 80
         canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
         canvas.paste(doc_pil, (40, 40))
 
-        print("-> ¡Documento procesado, nítido y unificado con éxito!")
+        print("-> ¡Documento procesado con éxito!")
         return canvas
 
     except Exception as e:
-        print(f"❌ Error crítico en procesamiento robusto: {str(e)}")
+        print(f"❌ Error en procesamiento guiado por color: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -144,7 +143,7 @@ class BOLRequest(BaseModel):
 async def process_bol(payload: BOLRequest):
     try:
         if not payload.image_urls or len(payload.image_urls) == 0:
-            raise HTTPException(status_code=400, detail="No se recibieron imágenes en el lote.")
+            raise HTTPException(status_code=400, detail="No se recibieron imágenes.")
 
         pil_images = []
         
@@ -166,9 +165,8 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
-                # REGLA: Carga horizontal a color optimizado; Documentos verticales pasan por el motor robusto
                 if w > h:
-                    print(f"-> Imagen {index+1}: Carga detectada (Horizontal - {w}x{h}). Optimizando a color.")
+                    print(f"-> Imagen {index+1}: Carga horizontal. A color.")
                     target_w = 1600
                     if w > target_w:
                         ratio = target_w / float(w)
@@ -176,17 +174,16 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Procesando con motor robusto.")
-                    clean_doc = process_document_robust(image_bytes)
+                    print(f"-> Imagen {index+1}: Documento vertical. Procesando con guía de color.")
+                    clean_doc = process_document_color_guided(image_bytes)
                     pil_images.append(clean_doc)
                 
             except Exception as img_err:
-                print(f"Advertencia procesando imagen {index}: {str(img_err)}")
+                print(f"Advertencia en imagen {index}: {str(img_err)}")
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
+            raise HTTPException(status_code=400, detail="Ninguna imagen procesada.")
 
-        # Compilar en PDF unificado de alta calidad y peso optimizado
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -207,11 +204,11 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF unificado con motor Robusto Local generado exitosamente."
+            "message": "PDF generado exitosamente."
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"Error crítico en /process-bol: {str(e)}")
+        print(f"Error crítico: {str(e)}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": str(e)}))
