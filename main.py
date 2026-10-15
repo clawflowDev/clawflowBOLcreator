@@ -10,73 +10,21 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW BOL/POD Final Cropper Engine", version="5.1")
+app = FastAPI(title="CLAWFLOW Clean Archive Engine", version="6.0")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW Final Cropper Engine Active"}
+    return {"status": "online", "service": "CLAWFLOW Clean Archive Engine Active"}
 
-def resize_image_if_needed(np_img: np.ndarray, max_width: int = 1600) -> np.ndarray:
-    h, w = np_img.shape[:2]
-    if w > max_width:
-        ratio = max_width / float(w)
-        new_h = int(h * ratio)
-        np_img = cv2.resize(np_img, (max_width, new_h), interpolation=cv2.INTER_AREA)
-    return np_img
-
-def auto_crop_document(np_img: np.ndarray) -> np.ndarray:
+def resize_and_clean_document(image_bytes: bytes) -> Image.Image:
     """
-    Motor de recorte optimizado (Versión 5.1):
-    Encuentra los contornos del papel de forma estricta para eliminar asientos,
-    mesas y fondos, dejando únicamente la hoja limpia.
+    Procesa la imagen para archivo limpio:
+    - Normaliza el tamaño y el encuadre.
+    - Aplica escala de grises y contraste natural balanceado (legible y uniforme).
+    - Recorta los márgenes exteriores para eliminar fondos no deseados (asientos/mesas).
     """
     try:
-        orig = np_img.copy()
-        h, w = orig.shape[:2]
-
-        # 1. Escala de grises y desenfoque gaussiano
-        gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-
-        # 2. Umbralización Otsu para separar el papel blanco del fondo oscuro de la mesa/asiento
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # 3. Encontrar contornos externos
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # Encontrar el contorno con mayor área (el papel)
-            max_c = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(max_c)
-            
-            # Si el área ocupa al menos el 10% de la imagen, es un documento válido
-            if area > (h * w * 0.10):
-                x, y, w_box, h_box = cv2.boundingRect(max_c)
-                
-                # Margen de seguridad ultra fino (5 píxeles) para no recortar texto pero eliminar todo el fondo
-                pad = 5
-                x1 = max(0, x - pad)
-                y1 = max(0, y - pad)
-                x2 = min(w, x + w_box + pad)
-                y2 = min(h, y + h_box + pad)
-                
-                cropped = orig[y1:y2, x1:x2]
-                if cropped.shape[0] > 100 and cropped.shape[1] > 100:
-                    print("-> ¡Auto-crop exitoso! Fondo eliminado correctamente.")
-                    return cropped
-
-    except Exception as e:
-        print(f"⚠️ Aviso en auto-crop preciso: {str(e)}")
-
-    # Fallback: Si por alguna razón extrema no halla el contorno, devuelve la imagen original
-    return np_img
-
-def process_document_final(image_bytes: bytes) -> Image.Image:
-    """
-    Combina el recorte estricto de la hoja con el contraste CLAHE perfecto.
-    """
-    try:
-        print("-> Procesando documento con motor Final (Crop estricto + Contraste óptimo)...")
+        print("-> Procesando documento para archivo limpio y uniforme...")
         
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -84,28 +32,41 @@ def process_document_final(image_bytes: bytes) -> Image.Image:
         if img is None:
             raise ValueError("No se pudo decodificar la imagen.")
 
-        # 1. Redimensionar para velocidad y precisión
-        img = resize_image_if_needed(img, max_width=1600)
+        h, w = img.shape[:2]
 
-        # 2. Recorte estricto del papel
-        cropped_img = auto_crop_document(img)
+        # 1. Recorte perimetral de seguridad (Trim): Remueve un 5% de los bordes exteriores 
+        # donde usualmente se cuelan los asientos, mesas o dedos, aislando el cuerpo principal del documento.
+        crop_y = int(h * 0.04)
+        crop_x = int(w * 0.04)
+        img_cropped = img[crop_y:h-crop_y, crop_x:w-crop_x]
 
-        # 3. Escala de grises
-        gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+        # 2. Redimensionar de forma estándar para mantener uniformidad en el archivo final
+        target_width = 1600
+        ch, cw = img_cropped.shape[:2]
+        if cw > target_width:
+            ratio = target_width / float(cw)
+            new_h = int(ch * ratio)
+            img_resized = cv2.resize(img_cropped, (target_width, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            img_resized = img_cropped
+
+        # 3. Convertir a escala de grises profesional
+        gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
         
-        # 4. CLAHE con el nivel de contraste exacto que te gustó (clipLimit=3.0)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # 4. Contraste equilibrado (CLAHE suave) para que la lectura sea perfecta y nítida sin deformar texto
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         
-        # 5. Reducción de ruido sutil
-        denoised = cv2.fastNlMeansDenoising(enhanced, h=10, templateWindowSize=7, searchWindowSize=21)
+        # 5. Reducción de ruido sutil para dejar el fondo blanco/gris claro limpio
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=8, templateWindowSize=7, searchWindowSize=21)
         
         processed_image = Image.fromarray(denoised).convert("RGB")
-        print("-> ¡Éxito total en el procesamiento del documento!")
+        print("-> ¡Documento procesado y unificado con éxito!")
         return processed_image
 
     except Exception as e:
-        print(f"❌ Error en procesamiento Final: {str(e)}")
+        print(f"❌ Error en procesamiento de archivo: {str(e)}")
+        # Fallback de seguridad
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         gray = cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY)
@@ -141,14 +102,18 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
+                # REGLA: Carga horizontal se mantiene a color optimizado; Documentos verticales se limpian para archivo
                 if w > h:
                     print(f"-> Imagen {index+1}: Carga detectada (Horizontal - {w}x{h}). Optimizando a color.")
-                    np_img_resized = resize_image_if_needed(np_img, max_width=1600)
-                    color_image = Image.fromarray(cv2.cvtColor(np_img_resized, cv2.COLOR_BGR2RGB))
+                    target_w = 1600
+                    if w > target_w:
+                        ratio = target_w / float(w)
+                        np_img = cv2.resize(np_img, (target_w, int(h * ratio)), interpolation=cv2.INTER_AREA)
+                    color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Aplicando recorte estricto y contraste.")
-                    clean_doc = process_document_final(image_bytes)
+                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Aplicando limpieza de archivo.")
+                    clean_doc = resize_and_clean_document(image_bytes)
                     pil_images.append(clean_doc)
                 
             except Exception as img_err:
@@ -157,6 +122,7 @@ async def process_bol(payload: BOLRequest):
         if not pil_images:
             raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
 
+        # Compilar en PDF unificado de alta calidad y peso optimizado
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -177,7 +143,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF unificado con motor Final Cropper generado exitosamente."
+            "message": "PDF unificado con motor Clean Archive generado exitosamente."
         }
 
     except HTTPException as he:
