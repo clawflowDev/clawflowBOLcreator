@@ -10,16 +10,16 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW BOL/POD Pro Scanner Engine", version="3.5")
+app = FastAPI(title="CLAWFLOW BOL/POD Natural Balance Engine", version="4.0")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW Pro Scanner Engine Active"}
+    return {"status": "online", "service": "CLAWFLOW Natural Balance Engine Active"}
 
 def resize_image_if_needed(np_img: np.ndarray, max_width: int = 1600) -> np.ndarray:
     """
     Redimensiona la imagen proporcionalmente si supera el ancho máximo para aligerar
-    el procesamiento y garantizar velocidad y estabilidad en el servidor.
+    el procesamiento y garantizar velocidad en el servidor.
     """
     h, w = np_img.shape[:2]
     if w > max_width:
@@ -28,15 +28,13 @@ def resize_image_if_needed(np_img: np.ndarray, max_width: int = 1600) -> np.ndar
         np_img = cv2.resize(np_img, (max_width, new_h), interpolation=cv2.INTER_AREA)
     return np_img
 
-def process_document_balanced_scanner(image_bytes: bytes) -> Image.Image:
+def process_document_natural_balance(image_bytes: bytes) -> Image.Image:
     """
-    Motor de escáner balanceado (Estilo CamScanner Pro):
-    - Redimensiona para optimizar peso.
-    - Suaviza el ruido de fondo respetando las líneas de texto.
-    - Aplica umbral adaptativo calibrado para evitar deformar o fragmentar las letras.
+    Motor de escáner de balance natural (CLAHE + Escala de Grises Optimizada):
+    Blanquea el fondo y oscurece el texto sutilmente sin destruir los trazos finos ni las firmas.
     """
     try:
-        print("-> Procesando documento con motor de escáner balanceado...")
+        print("-> Procesando documento con balance natural y CLAHE...")
         
         # 1. Decodificar bytes a matriz OpenCV
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -45,32 +43,27 @@ def process_document_balanced_scanner(image_bytes: bytes) -> Image.Image:
         if img is None:
             raise ValueError("No se pudo decodificar la imagen.")
 
-        # 2. Redimensionar para evitar imágenes gigantescas de 5MB+
+        # 2. Redimensionar para optimizar peso
         img = resize_image_if_needed(img, max_width=1600)
 
-        # 3. Escala de grises
+        # 3. Convertir a escala de grises
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # 4. Filtro bilateral: Elimina texturas y sombras de la mesa manteniendo el texto ultra nítido
-        denoised = cv2.bilateralFilter(gray, 11, 85, 85)
+        # 4. Aplicar CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        # Esto realza los contrastes locales de forma inteligente: aclara el fondo gris y oscurece las letras limpiamente.
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
         
-        # 5. Umbral adaptativo calibrado (Offset en 12 para evitar que las letras se 'coman' o se rompan)
-        thresh = cv2.adaptiveThreshold(
-            denoised, 
-            255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            15,  # Vecindad óptima para documentos tamaño carta/factura
-            12   # Offset equilibrado para conservar el grosor de las letras
-        )
+        # 5. Suavizado muy sutil para eliminar ruido sin perder nitidez en las letras
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=10, templateWindowSize=7, searchWindowSize=21)
         
         # Convertir a PIL RGB
-        processed_image = Image.fromarray(thresh).convert("RGB")
-        print("-> ¡Éxito! Documento procesado con balance perfecto.")
+        processed_image = Image.fromarray(denoised).convert("RGB")
+        print("-> ¡Éxito! Documento procesado con balance natural.")
         return processed_image
 
     except Exception as e:
-        print(f"❌ Error en el escáner balanceado: {str(e)}")
+        print(f"❌ Error en el procesamiento natural: {str(e)}")
         # Fallback de seguridad local
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -108,15 +101,15 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
-                # REGLA: Carga horizontal a color (optimizada de peso), Documentos verticales con escáner balanceado
+                # REGLA: Carga horizontal a color (optimizada de peso), Documentos verticales con balance natural
                 if w > h:
                     print(f"-> Imagen {index+1}: Carga detectada (Horizontal - {w}x{h}). Optimizando a color.")
                     np_img_resized = resize_image_if_needed(np_img, max_width=1600)
                     color_image = Image.fromarray(cv2.cvtColor(np_img_resized, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Aplicando escáner balanceado.")
-                    clean_doc = process_document_balanced_scanner(image_bytes)
+                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Aplicando balance natural.")
+                    clean_doc = process_document_natural_balance(image_bytes)
                     pil_images.append(clean_doc)
                 
             except Exception as img_err:
@@ -135,7 +128,7 @@ async def process_bol(payload: BOLRequest):
             format="PDF",
             save_all=True,
             append_images=remaining_images,
-            quality=85,
+            quality=90,
             optimize=True
         )
         
@@ -146,7 +139,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF unificado con motor Pro Scanner generado exitosamente."
+            "message": "PDF unificado con motor de balance natural generado exitosamente."
         }
 
     except HTTPException as he:
