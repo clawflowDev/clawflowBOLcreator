@@ -7,9 +7,19 @@ from pydantic import BaseModel
 import requests
 import numpy as np
 import cv2
-from PIL import Image, ImageOps
+from PIL import Image
+import cloudinary
+import cloudinary.uploader
+import os
 
-app = FastAPI(title="CLAWFLOW BOL/POD CamScanner Engine", version="1.0")
+app = FastAPI(title="CLAWFLOW BOL/POD Cloudinary Engine", version="2.0")
+
+# Configurar Cloudinary usando las variables de entorno de Render
+cloudinary.config(
+  cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME"),
+  api_key = os.environ.get("CLOUDINARY_API_KEY"),
+  api_secret = os.environ.get("CLOUDINARY_API_SECRET")
+)
 
 class BOLRequest(BaseModel):
     image_urls: List[str]
@@ -17,96 +27,44 @@ class BOLRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW CamScanner Microservice Active"}
+    return {"status": "online", "service": "CLAWFLOW Cloudinary Microservice Active"}
 
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image, pts):
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
-
-def camscanner_process(np_image):
+def process_document_with_cloudinary(image_bytes: bytes) -> Image.Image:
     """
-    Aplica binarización avanzada estilo CamScanner: fondo blanco puro y texto ultra nítido,
-    garantizando que nunca falle ni baje la calidad.
+    Sube la imagen a Cloudinary y aplica transformaciones automáticas de calidad profesional
+    (mejora de iluminación, alto contraste, nitidez y conversión a grises limpia).
     """
     try:
-        gray = cv2.cvtColor(np_image, cv2.COLOR_BGR2GRAY)
-        
-        # Intento de detección de bordes para recorte inteligente
-        blur = cv2.bilateralFilter(gray, 11, 17, 17)
-        edged = cv2.Canny(blur, 30, 200)
-
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-
-        screen_cnt = None
-        orig_area = np_image.shape[0] * np_image.shape[1]
-
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.contourArea(approx) > (orig_area * 0.15):
-                screen_cnt = approx
-                break
-
-        working_img = np_image
-        if screen_cnt is not None:
-            working_img = four_point_transform(np_image, screen_cnt.squeeze())
-        else:
-            # Fallback seguro: Si no encuentra los 4 puntos exactos, recortamos un 3% de los bordes 
-            # exteriores para limpiar la mesa sin deformar ni manchar la hoja.
-            h, w = gray.shape
-            margin_h, margin_w = int(h * 0.03), int(w * 0.03)
-            working_img = np_image[margin_h:h-margin_h, margin_w:w-margin_w]
-
-        # --- MAGIA ESTILO CAMSCANNER (Threshold Adaptativo) ---
-        # Convierte a escala de grises la imagen de trabajo
-        gray_work = cv2.cvtColor(working_img, cv2.COLOR_BGR2GRAY)
-        
-        # Elimina sombras de iluminación despareja y vuelve el fondo blanco absoluto con texto negro nítido
-        denoised = cv2.fastNlMeansDenoising(gray_work, h=10)
-        thresh = cv2.adaptiveThreshold(
-            denoised, 255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            21, 10
+        print("-> Subiendo documento a Cloudinary...")
+        # Subir los bytes de la imagen directamente a Cloudinary
+        upload_result = cloudinary.uploader.upload(
+            image_bytes,
+            transformation=[
+                {"effect": "improve"},                    # Corrige iluminación general y sombras
+                {"effect": "contrast:60"},                 # Blanquea el fondo y oscurece las letras
+                {"effect": "sharpen:100"},                # Nitidez milimétrica al texto y firmas
+                {"effect": "grayscale"},                  # Pasa a escala de grises limpia profesional
+                {"fetch_format": "jpg"}
+            ]
         )
+        
+        processed_url = upload_result.get("secure_url")
+        print(f"-> ¡Éxito en Cloudinary! URL procesada: {processed_url}")
 
-        return Image.fromarray(thresh).convert("RGB")
+        # Descargar la imagen ya procesada
+        resp = requests.get(processed_url, timeout=20)
+        resp.raise_for_status()
+        
+        processed_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        return processed_image
 
     except Exception as e:
-        print(f"Aviso en procesamiento CamScanner: {str(e)}")
-        # Fallback ultra seguro en grises limpios
-        gray = cv2.cvtColor(np_image, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-        return Image.fromarray(thresh).convert("RGB")
+        print(f"❌ ERROR CRÍTICO procesando con Cloudinary: {str(e)}")
+        # Fallback de seguridad local si llegara a fallar la conexión con Cloudinary
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY)
+        return Image.fromarray(gray).convert("RGB")
 
 @app.post("/process-bol")
 async def process_bol(payload: BOLRequest):
@@ -126,6 +84,7 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
+                # Análisis de orientación (ancho vs alto) para diferenciar Carga vs Documento
                 nparr = np.frombuffer(image_bytes, np.uint8)
                 np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
@@ -134,14 +93,14 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
-                # REGLA: Carga horizontal a color, Documentos verticales con filtro CamScanner
+                # REGLA: Carga horizontal a color, Documentos verticales procesados con Cloudinary
                 if w > h:
-                    print(f"-> Imagen {index+1}: Carga detectada (Horizontal). A todo color.")
+                    print(f"-> Imagen {index+1}: Carga detectada (Horizontal - Ancho {w} > Alto {h}). A todo color.")
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento detectado (Vertical). Aplicando motor CamScanner.")
-                    clean_doc = camscanner_process(np_img)
+                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - Alto {h} >= Ancho {w}). Enviando a Cloudinary.")
+                    clean_doc = process_document_with_cloudinary(image_bytes)
                     pil_images.append(clean_doc)
                 
             except Exception as img_err:
@@ -169,7 +128,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado con éxito bajo motor CamScanner (fondos blancos y máxima legibilidad)."
+            "message": "PDF unificado con motor Cloudinary generado exitosamente."
         }
 
     except HTTPException as he:
