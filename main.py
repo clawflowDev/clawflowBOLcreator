@@ -10,127 +10,149 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Color-Aided Edge Engine", version="9.1")
+app = FastAPI(title="CLAWFLOW Groq Vision Engine", version="10.1")
+
+# Obtener la API Key de Groq desde las variables de entorno de Render
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW Color-Aided Edge Engine Active"}
+    return {"status": "online", "service": "CLAWFLOW Groq Vision & OpenCV Engine Active"}
 
-def order_points(pts):
-    """Ordena los 4 puntos cardinales de un contorno: superior-izq, superior-der, inferior-der, inferior-izq."""
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image, pts):
-    """Realiza la corrección de perspectiva (Enderezar y aislar la hoja)."""
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
-
-def process_document_color_guided(image_bytes: bytes) -> Image.Image:
+def get_document_bounding_box_from_groq(image_bytes: bytes, original_w: int, original_h: int) -> list:
     """
-    Motor con Detección a Color:
-    1. Analiza los canales de color originales para encontrar los bordes de la hoja sin confundirse con grises.
-    2. Aisla y endereza la perspectiva.
-    3. Realza el texto para máxima legibilidad de archivo.
+    Envía la imagen a Groq Vision para que identifique las coordenadas [ymin, xmin, ymax, xmax] 
+    de la hoja de papel (escala de 0 a 1000).
+    """
+    if not GROQ_API_KEY:
+        print("⚠️ Advertencia: GROQ_API_KEY no está configurada en Render.")
+        return None
+
+    try:
+        print("-> Consultando a Groq Vision para detectar los límites exactos de la hoja...")
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": "llama-3.2-90b-vision-preview",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Analiza esta imagen y detecta estrictamente las coordenadas de los límites del documento de papel (Bill of Lading / página) ignorando por completo el fondo, los asientos o la mesa. Devuelve SOLAMENTE un objeto JSON válido con este formato exacto, sin texto markdown adicional: {\"box_2d\": [ymin, xmin, ymax, xmax]} donde los valores estén en una escala de 0 a 1000."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": 150
+        }
+
+        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        
+        result_json = response.json()
+        content = result_json["choices"][0]["message"]["content"].strip()
+        
+        # Limpiar posibles bloques markdown de la respuesta
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+
+        parsed = json.loads(content)
+        box = parsed.get("box_2d")
+
+        if box and len(box) == 4:
+            ymin, xmin, ymax, xmax = box
+            # Traducir de escala 0-1000 a píxeles reales
+            pixel_ymin = int((ymin / 1000.0) * original_h)
+            pixel_xmin = int((xmin / 1000.0) * original_w)
+            pixel_ymax = int((ymax / 1000.0) * original_h)
+            pixel_xmax = int((xmax / 1000.0) * original_w)
+            
+            print(f"-> Groq Vision detectó el documento en: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
+            return [pixel_ymin, pixel_xmin, pixel_ymax, pixel_xmax]
+
+    except Exception as e:
+        print(f"⚠️ Error al consultar Groq Vision: {str(e)}")
+
+    return None
+
+def process_document_with_groq_vision(image_bytes: bytes) -> Image.Image:
+    """
+    Procesa el documento usando las coordenadas de Groq Vision + realce OpenCV.
     """
     try:
-        print("-> Procesando documento con guía de color para bordes...")
-        
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
             raise ValueError("No se pudo decodificar la imagen.")
 
-        h, w = img.shape[:2]
-        
-        # Redimensionar para estabilidad
-        max_dim = 1600
-        if max(h, w) > max_dim:
-            scale = max_dim / float(max(h, w))
-            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-            h, w = img.shape[:2]
+        original_h, original_w = img.shape[:2]
 
-        # Convertir a espacio de color LAB o HSV para potenciar la separación de tonos (Color-based edge detection)
-        # El canal L (Luminancia) combinado con saturación ayuda muchísimo a aislar el papel blanco de asientos oscuros.
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-        
-        # Desenfoque suave para eliminar texturas de la tela del asiento
-        blurred = cv2.GaussianBlur(l_channel, (7, 7), 0)
-        
-        # Umbralización Otsu sobre el canal de luminancia optimizado
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 1. Obtener coordenadas de recorte mediante Groq Vision
+        box = get_document_bounding_box_from_groq(image_bytes, original_w, original_h)
 
-        contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-
-        warped = None
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if box:
+            ymin, xmin, ymax, xmax = box
+            # Margen de seguridad interno del 1% para evitar bordes sucios
+            margin_y = int((ymax - ymin) * 0.01)
+            margin_x = int((xmax - xmin) * 0.01)
             
-            # Si tiene 4 esquinas y ocupa más del 15% de la imagen
-            if len(approx) == 4 and cv2.contourArea(c) > (h * w * 0.15):
-                try:
-                    warped = four_point_transform(img, approx.reshape(4, 2))
-                    break
-                except Exception:
-                    continue
-
-        if warped is not None and warped.shape[0] > 200 and warped.shape[1] > 200:
-            print("-> ¡Detección guiada por color exitosa! Hoja aislada.")
-            target_doc = warped
+            y1 = max(0, ymin + margin_y)
+            x1 = max(0, xmin + margin_x)
+            y2 = min(original_h, ymax - margin_y)
+            x2 = min(original_w, xmax - margin_x)
+            
+            cropped_doc = img[y1:y2, x1:x2]
+            print("-> Recorte milimétrico aplicado con éxito mediante Groq Vision.")
         else:
-            print("-> Aviso: Detección estricta no concluyente. Aplicando recorte de respaldo seguro.")
-            pad_y = int(h * 0.05)
-            pad_x = int(w * 0.05)
-            target_doc = img[pad_y:h-pad_y, pad_x:w-pad_x]
+            print("-> Aviso: Usando recorte de respaldo seguro.")
+            crop_y = int(original_h * 0.05)
+            crop_x = int(original_w * 0.05)
+            cropped_doc = img[crop_y:original_h-crop_y, crop_x:original_w-crop_x]
 
-        # Post-procesamiento enfocado en nitidez de texto manteniendo escala de grises limpia
-        gray_doc = cv2.cvtColor(target_doc, cv2.COLOR_BGR2GRAY)
+        # 2. Redimensionar estándar a 1600px de ancho
+        target_width = 1600
+        ch, cw = cropped_doc.shape[:2]
+        if cw > target_width:
+            ratio = target_width / float(cw)
+            new_h = int(ch * ratio)
+            cropped_doc = cv2.resize(cropped_doc, (target_width, new_h), interpolation=cv2.INTER_AREA)
+
+        # 3. Realce de contraste corporativo (CLAHE)
+        gray = cv2.cvtColor(cropped_doc, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray_doc)
+        enhanced = clahe.apply(gray)
         
         denoised = cv2.fastNlMeansDenoising(enhanced, h=8, templateWindowSize=7, searchWindowSize=21)
         doc_pil = Image.fromarray(denoised).convert("RGB")
 
-        # Lienzo de estandarización final (Padding simétrico elegante)
+        # 4. Lienzo blanco estandarizado (Padding simétrico)
         dw, dh = doc_pil.size
         canvas_w = dw + 80
         canvas_h = dh + 80
         canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
         canvas.paste(doc_pil, (40, 40))
 
-        print("-> ¡Documento procesado con éxito!")
         return canvas
 
     except Exception as e:
-        print(f"❌ Error en procesamiento guiado por color: {str(e)}")
+        print(f"❌ Error crítico en procesamiento: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -143,7 +165,7 @@ class BOLRequest(BaseModel):
 async def process_bol(payload: BOLRequest):
     try:
         if not payload.image_urls or len(payload.image_urls) == 0:
-            raise HTTPException(status_code=400, detail="No se recibieron imágenes.")
+            raise HTTPException(status_code=400, detail="No se recibieron imágenes en el lote.")
 
         pil_images = []
         
@@ -165,6 +187,7 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
+                # REGLA: Horizontal a color; Vertical procesado con Groq Vision
                 if w > h:
                     print(f"-> Imagen {index+1}: Carga horizontal. A color.")
                     target_w = 1600
@@ -174,15 +197,15 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento vertical. Procesando con guía de color.")
-                    clean_doc = process_document_color_guided(image_bytes)
+                    print(f"-> Imagen {index+1}: Documento vertical. Procesando con Groq Vision.")
+                    clean_doc = process_document_with_groq_vision(image_bytes)
                     pil_images.append(clean_doc)
                 
             except Exception as img_err:
-                print(f"Advertencia en imagen {index}: {str(img_err)}")
+                print(f"Advertencia procesando imagen {index}: {str(img_err)}")
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="Ninguna imagen procesada.")
+            raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
 
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
@@ -204,11 +227,11 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente."
+            "message": "PDF unificado con Groq Vision generado exitosamente."
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"Error crítico: {str(e)}")
+        print(f"Error crítico en /process-bol: {str(e)}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": str(e)}))
