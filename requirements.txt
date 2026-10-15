@@ -4,3 +4,5 @@ pydantic
 Pillow
 requests
 python-multipart
+numpy
+opencv-python-headless
