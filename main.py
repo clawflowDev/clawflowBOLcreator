@@ -7,24 +7,24 @@ from pydantic import BaseModel
 import requests
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps
 import os
 
-app = FastAPI(title="CLAWFLOW Clean Archive Engine", version="6.0")
+app = FastAPI(title="CLAWFLOW Clean Canvas Engine", version="7.0")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW Clean Archive Engine Active"}
+    return {"status": "online", "service": "CLAWFLOW Clean Canvas Engine Active"}
 
-def resize_and_clean_document(image_bytes: bytes) -> Image.Image:
+def process_document_on_clean_canvas(image_bytes: bytes) -> Image.Image:
     """
-    Procesa la imagen para archivo limpio:
-    - Normaliza el tamaño y el encuadre.
-    - Aplica escala de grises y contraste natural balanceado (legible y uniforme).
-    - Recorta los márgenes exteriores para eliminar fondos no deseados (asientos/mesas).
+    Procesa la imagen para archivo limpio usando un lienzo blanco uniforme:
+    - Realiza el realce de contraste perfecto (CLAHE) para legibilidad óptima.
+    - Coloca la imagen centrada sobre un fondo/lienzo blanco puro estandarizado,
+      eliminando visualmente todo el fondo de asientos, mesas o entornos sin arriesgar texto.
     """
     try:
-        print("-> Procesando documento para archivo limpio y uniforme...")
+        print("-> Procesando documento con motor Clean Canvas...")
         
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -32,45 +32,54 @@ def resize_and_clean_document(image_bytes: bytes) -> Image.Image:
         if img is None:
             raise ValueError("No se pudo decodificar la imagen.")
 
-        h, w = img.shape[:2]
-
-        # 1. Recorte perimetral de seguridad (Trim): Remueve un 5% de los bordes exteriores 
-        # donde usualmente se cuelan los asientos, mesas o dedos, aislando el cuerpo principal del documento.
-        crop_y = int(h * 0.04)
-        crop_x = int(w * 0.04)
-        img_cropped = img[crop_y:h-crop_y, crop_x:w-crop_x]
-
-        # 2. Redimensionar de forma estándar para mantener uniformidad en el archivo final
+        # 1. Redimensionar de forma estándar para mantener uniformidad (ancho base de 1600px)
         target_width = 1600
-        ch, cw = img_cropped.shape[:2]
-        if cw > target_width:
-            ratio = target_width / float(cw)
-            new_h = int(ch * ratio)
-            img_resized = cv2.resize(img_cropped, (target_width, new_h), interpolation=cv2.INTER_AREA)
+        h, w = img.shape[:2]
+        if w > target_width:
+            ratio = target_width / float(w)
+            new_h = int(h * ratio)
+            img_resized = cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_AREA)
         else:
-            img_resized = img_cropped
+            img_resized = img
 
-        # 3. Convertir a escala de grises profesional
+        # 2. Convertir a escala de grises profesional
         gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
         
-        # 4. Contraste equilibrado (CLAHE suave) para que la lectura sea perfecta y nítida sin deformar texto
+        # 3. Contraste equilibrado (CLAHE) para que la lectura sea perfecta y nítida
         clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         
-        # 5. Reducción de ruido sutil para dejar el fondo blanco/gris claro limpio
+        # 4. Reducción de ruido sutil
         denoised = cv2.fastNlMeansDenoising(enhanced, h=8, templateWindowSize=7, searchWindowSize=21)
         
-        processed_image = Image.fromarray(denoised).convert("RGB")
-        print("-> ¡Documento procesado y unificado con éxito!")
-        return processed_image
+        # Convertir a PIL Image en RGB
+        doc_image = Image.fromarray(denoised).convert("RGB")
+
+        # 5. El toque maestro del Lienzo Blanco (Canvas Padding):
+        # Creamos un lienzo vertical estándar tipo documento limpio (ej: proporción A4 / Carta de 1700x2200 o basado en la foto)
+        doc_w, doc_h = doc_image.size
+        canvas_width = max(doc_w + 100, 1650)   # Margen simétrico a los lados
+        canvas_height = max(doc_h + 100, 2200)  # Margen simétrico arriba y abajo
+        
+        # Crear lienzo completamente blanco puro
+        canvas = Image.new("RGB", (canvas_width, canvas_height), (255, 255, 255))
+        
+        # Calcular posición exacta para centrar la foto del documento en el lienzo
+        offset_x = (canvas_width - doc_w) // 2
+        offset_y = (canvas_height - doc_h) // 2
+        
+        # Pegar el documento en el centro exacto del lienzo blanco
+        canvas.paste(doc_image, (offset_x, offset_y))
+        
+        print("-> ¡Documento unificado y centrado en lienzo blanco con éxito!")
+        return canvas
 
     except Exception as e:
-        print(f"❌ Error en procesamiento de archivo: {str(e)}")
+        print(f"❌ Error en procesamiento de lienzo: {str(e)}")
         # Fallback de seguridad
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        gray = cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY)
-        return Image.fromarray(gray).convert("RGB")
+        return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
 
 class BOLRequest(BaseModel):
     image_urls: List[str]
@@ -102,7 +111,7 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
-                # REGLA: Carga horizontal se mantiene a color optimizado; Documentos verticales se limpian para archivo
+                # REGLA: Carga horizontal se mantiene a color optimizado; Documentos verticales pasan por el motor Clean Canvas
                 if w > h:
                     print(f"-> Imagen {index+1}: Carga detectada (Horizontal - {w}x{h}). Optimizando a color.")
                     target_w = 1600
@@ -112,8 +121,8 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Aplicando limpieza de archivo.")
-                    clean_doc = resize_and_clean_document(image_bytes)
+                    print(f"-> Imagen {index+1}: Documento detectado (Vertical - {w}x{h}). Aplicando Clean Canvas.")
+                    clean_doc = process_document_on_clean_canvas(image_bytes)
                     pil_images.append(clean_doc)
                 
             except Exception as img_err:
@@ -143,7 +152,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF unificado con motor Clean Archive generado exitosamente."
+            "message": "PDF unificado con motor Clean Canvas generado exitosamente."
         }
 
     except HTTPException as he:
