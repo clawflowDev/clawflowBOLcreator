@@ -7,9 +7,9 @@ from pydantic import BaseModel
 import requests
 import numpy as np
 import cv2
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image
 
-app = FastAPI(title="CLAWFLOW BOL/POD Advanced Processor", version="1.0")
+app = FastAPI(title="CLAWFLOW BOL/POD Smart Processor - Step 1", version="1.0")
 
 class BOLRequest(BaseModel):
     image_urls: List[str]
@@ -17,92 +17,30 @@ class BOLRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW BOL Batch Microservice with Auto-Crop"}
+    return {"status": "online", "service": "CLAWFLOW BOL Microservice Active"}
 
-def auto_crop_and_enhance(np_image):
+def enhance_document_with_clahe(np_image):
     """
-    Detecta los bordes del papel en la imagen, recorta el fondo y aplica efecto escáner.
+    Aplica mejora tipo escáner profesional usando CLAHE para eliminar sombras
+    y resaltar el texto de los documentos de forma impecable.
     """
     try:
-        # Convertir a escala de grises
+        # 1. Convertir a escala de grises
         gray = cv2.cvtColor(np_image, cv2.COLOR_BGR2GRAY)
         
-        # Aplicar desenfoque para reducir ruido
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        # 2. Aplicar CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        # Esto equilibra las sombras locales (como los dobleces del papel o la luz desigual)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced_gray = clahe.apply(gray)
         
-        # Detección de bordes (Canny)
-        edged = cv2.Canny(blur, 75, 200)
-        
-        # Encontrar contornos en la imagen de bordes
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-        
-        screen_cnt = None
-        for c in contours:
-            # Aproximar el contorno
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            
-            # Si el contorno aproximado tiene 4 puntos, asumimos que es la hoja del documento
-            if len(approx) == 4:
-                screen_cnt = approx
-                break
-                
-        # Si encuentra un contorno rectangular válido de hoja, hace el recorte y perspectiva
-        if screen_cnt is not None:
-            # Reorganizar puntos para la perspectiva
-            pts = screen_cnt.reshape(4, 2)
-            rect = np.zeros((4, 2), dtype="float32")
-            
-            s = pts.sum(axis=1)
-            rect[0] = pts[np.argmin(s)]
-            rect[2] = pts[np.argmax(s)]
-            
-            diff = np.diff(pts, axis=1)
-            rect[1] = pts[np.argmin(diff)]
-            rect[3] = pts[np.argmax(diff)]
-            
-            (tl, tr, br, bl) = rect
-            
-            widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-            widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-            maxWidth = max(int(widthA), int(widthB))
-            
-            heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-            heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-            maxHeight = max(int(heightA), int(heightB))
-            
-            dst = np.array([
-                [0, 0],
-                [maxWidth - 1, 0],
-                [maxWidth - 1, maxHeight - 1],
-                [0, maxHeight - 1]], dtype="float32")
-                
-            M = cv2.getPerspectiveTransform(rect, dst)
-            warped = cv2.warpPerspective(np_image, M, (maxWidth, maxHeight))
-            
-            # Si el recorte fue exitoso y tiene dimensiones lógicas, lo usamos
-            if warped.shape[0] > 100 and warped.shape[1] > 100:
-                np_image = warped
-        
-        # --- EFECTO ESCÁNER PROFESIONAL ---
-        # Convertir a PIL para aplicar mejoras de contraste y nitidez fina
-        image = Image.fromarray(cv2.cvtColor(np_image, cv2.COLOR_BGR2RGB))
-        image = image.convert("L")
-        
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.9) # Alto contraste para blanquear fondo
-        image = image.filter(ImageFilter.SHARPEN)
-        
-        image = image.convert("RGB")
+        # 3. Convertir de vuelta a imagen PIL RGB para el PDF
+        image = Image.fromarray(enhanced_gray).convert("RGB")
         return image
-        
     except Exception as e:
-        print(f"Aviso en auto-crop, usando imagen original mejorada: {str(e)}")
-        # Fallback de seguridad si el contorno no es claro: procesa la imagen completa
-        image = Image.fromarray(cv2.cvtColor(np_image, cv2.COLOR_BGR2RGB)).convert("L")
-        image = ImageEnhance.Contrast(image).enhance(1.8)
-        return image.convert("RGB")
+        print(f"Aviso en CLAHE, usando grises estándar: {str(e)}")
+        # Fallback de seguridad
+        gray = cv2.cvtColor(np_image, cv2.COLOR_BGR2GRAY)
+        return Image.fromarray(gray).convert("RGB")
 
 @app.post("/process-bol")
 async def process_bol(payload: BOLRequest):
@@ -122,16 +60,25 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                # Cargar imagen con OpenCV en memoria
                 nparr = np.frombuffer(image_bytes, np.uint8)
                 np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
                 if np_img is None:
                     continue
 
-                # Procesar: Recorte automático, enderezamiento y efecto escáner
-                processed_pil_image = auto_crop_and_enhance(np_img)
-                pil_images.append(processed_pil_image)
+                h, w, _ = np_img.shape
+
+                # --- CLASIFICACIÓN DINÁMICA ---
+                # Analizamos si es una foto de carga (horizontal / landscape) o un documento (vertical / portrait).
+                # (Más adelante en el paso 2 afinaremos esto con análisis de color y saturación).
+                if w > h:
+                    print(f"-> Imagen {index+1}: Detectada como Carga (Horizontal). Manteniendo a color.")
+                    color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
+                    pil_images.append(color_image)
+                else:
+                    print(f"-> Imagen {index+1}: Detectada como Documento (Vertical). Aplicando efecto escáner CLAHE.")
+                    processed_doc = enhance_document_with_clahe(np_img)
+                    pil_images.append(processed_doc)
                 
             except Exception as img_err:
                 print(f"Advertencia procesando imagen {index}: {str(img_err)}")
@@ -158,7 +105,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF con recorte inteligente y efecto escáner generado exitosamente."
+            "message": "Paso 1 completado: Carga a color y documentos con escáner inteligente CLAHE."
         }
 
     except HTTPException as he:
