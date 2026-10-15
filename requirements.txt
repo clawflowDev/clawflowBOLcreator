@@ -6,4 +6,3 @@ requests
 python-multipart
 numpy
 opencv-python-headless
-cloudinary
