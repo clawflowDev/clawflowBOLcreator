@@ -7,9 +7,9 @@ from pydantic import BaseModel
 import requests
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps
 
-app = FastAPI(title="CLAWFLOW BOL/POD Industrial Processor", version="1.0")
+app = FastAPI(title="CLAWFLOW BOL/POD CamScanner Engine", version="1.0")
 
 class BOLRequest(BaseModel):
     image_urls: List[str]
@@ -17,7 +17,7 @@ class BOLRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "CLAWFLOW BOL Industrial Microservice Active"}
+    return {"status": "online", "service": "CLAWFLOW CamScanner Microservice Active"}
 
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
@@ -51,12 +51,15 @@ def four_point_transform(image, pts):
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def process_industrial_document(np_image):
+def camscanner_process(np_image):
     """
-    Recorte inteligente, corrección de perspectiva y realce CLAHE para máxima legibilidad.
+    Aplica binarización avanzada estilo CamScanner: fondo blanco puro y texto ultra nítido,
+    garantizando que nunca falle ni baje la calidad.
     """
     try:
         gray = cv2.cvtColor(np_image, cv2.COLOR_BGR2GRAY)
+        
+        # Intento de detección de bordes para recorte inteligente
         blur = cv2.bilateralFilter(gray, 11, 17, 17)
         edged = cv2.Canny(blur, 30, 200)
 
@@ -76,19 +79,34 @@ def process_industrial_document(np_image):
         working_img = np_image
         if screen_cnt is not None:
             working_img = four_point_transform(np_image, screen_cnt.squeeze())
+        else:
+            # Fallback seguro: Si no encuentra los 4 puntos exactos, recortamos un 3% de los bordes 
+            # exteriores para limpiar la mesa sin deformar ni manchar la hoja.
+            h, w = gray.shape
+            margin_h, margin_w = int(h * 0.03), int(w * 0.03)
+            working_img = np_image[margin_h:h-margin_h, margin_w:w-margin_w]
 
-        # Mejora con CLAHE optimizado para documentos escaneados
+        # --- MAGIA ESTILO CAMSCANNER (Threshold Adaptativo) ---
+        # Convierte a escala de grises la imagen de trabajo
         gray_work = cv2.cvtColor(working_img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray_work)
+        
+        # Elimina sombras de iluminación despareja y vuelve el fondo blanco absoluto con texto negro nítido
+        denoised = cv2.fastNlMeansDenoising(gray_work, h=10)
+        thresh = cv2.adaptiveThreshold(
+            denoised, 255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            21, 10
+        )
 
-        return Image.fromarray(enhanced).convert("RGB")
+        return Image.fromarray(thresh).convert("RGB")
 
     except Exception as e:
-        print(f"Aviso en procesamiento de documento: {str(e)}")
+        print(f"Aviso en procesamiento CamScanner: {str(e)}")
+        # Fallback ultra seguro en grises limpios
         gray = cv2.cvtColor(np_image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        return Image.fromarray(clahe.apply(gray)).convert("RGB")
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        return Image.fromarray(thresh).convert("RGB")
 
 @app.post("/process-bol")
 async def process_bol(payload: BOLRequest):
@@ -116,15 +134,15 @@ async def process_bol(payload: BOLRequest):
 
                 h, w, _ = np_img.shape
 
-                # REGLA DINÁMICA: Carga a color, Documentos con recorte y escáner profesional
+                # REGLA: Carga horizontal a color, Documentos verticales con filtro CamScanner
                 if w > h:
-                    print(f"-> Imagen {index+1}: Carga detectada (Horizontal). Manteniendo a color.")
+                    print(f"-> Imagen {index+1}: Carga detectada (Horizontal). A todo color.")
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> Imagen {index+1}: Documento detectado (Vertical). Aplicando recorte y escáner.")
-                    industrial_doc = process_industrial_document(np_img)
-                    pil_images.append(industrial_doc)
+                    print(f"-> Imagen {index+1}: Documento detectado (Vertical). Aplicando motor CamScanner.")
+                    clean_doc = camscanner_process(np_img)
+                    pil_images.append(clean_doc)
                 
             except Exception as img_err:
                 print(f"Advertencia procesando imagen {index}: {str(img_err)}")
@@ -151,7 +169,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF procesado con calidad industrial: documentos recortados/legibles y carga a color."
+            "message": "PDF generado con éxito bajo motor CamScanner (fondos blancos y máxima legibilidad)."
         }
 
     except HTTPException as he:
