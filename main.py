@@ -10,22 +10,21 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Resilient Vision Engine", version="15.0")
+app = FastAPI(title="CLAWFLOW Classic HF Vision Engine", version="16.0")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# Lista de modelos en orden de prioridad (Cascada / Failover)
-# Si el primero falla (por permisos o aprobación), el script prueba con el siguiente de forma transparente.
+# Modelos en cascada apuntando al endpoint clásico de inferencia
 VISION_MODELS_CANDIDATES = [
     "meta-llama/Llama-3.2-11B-Vision-Instruct",
-    "Qwen/Qwen2-VL-7B-Instruct",  # Excelente modelo multimodal abierto, sin restricciones de licencia pesadas
-    "microsoft/Phi-3-vision-128k-instruct" # Alternativa visual de Microsoft altamente capaz
+    "Qwen/Qwen2-VL-7B-Instruct",
+    "microsoft/Phi-3-vision-128k-instruct"
 ]
 
 @app.get("/")
 def health_check():
     token_status = "CONFIGURADA (Longitud: " + str(len(HF_TOKEN)) + ")" if HF_TOKEN else "NO CONFIGURADA ❌"
-    return {"status": "online", "service": "CLAWFLOW Resilient Vision Engine Active", "hf_token_status": token_status}
+    return {"status": "online", "service": "CLAWFLOW Classic HF Vision Engine Active", "hf_token_status": token_status}
 
 def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h: int) -> list:
     if not HF_TOKEN:
@@ -37,7 +36,6 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json"
     }
-    api_url = "https://router.huggingface.co/v1/chat/completions"
 
     prompt_text = (
         "Analiza esta imagen a color y localiza estrictamente los límites del documento de papel (la hoja de Bill of Lading / recibo). "
@@ -46,42 +44,64 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
         "{\"box_2d\": [ymin, xmin, ymax, xmax]} donde los valores estén en una escala de 0 a 1000."
     )
 
-    # Iterar sobre la lista de modelos candidatos (Cascada de Respaldo)
     for index, model_name in enumerate(VISION_MODELS_CANDIDATES):
         try:
-            print(f"-> [LOG 2.1.{index}] Intentando con modelo de respaldo [{model_name}]...")
+            print(f"-> [LOG 2.1.{index}] Intentando con endpoint clásico para [{model_name}]...")
             
+            # Endpoint clásico de inferencia serverless por modelo
+            api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+
+            # Formato compatible con chat completions de la API clásica
             payload = {
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt_text},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                "inputs": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
                                 }
-                            }
-                        ]
-                    }
-                ],
-                "temperature": 0.0,
-                "max_tokens": 150
+                            ]
+                        }
+                    ]
+                },
+                "parameters": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 150
+                }
             }
 
-            response = requests.post(api_url, headers=headers, json=payload, timeout=20)
+            response = requests.post(api_url, headers=headers, json=payload, timeout=25)
             
-            print(f"-> [LOG 2.2.{index}] HTTP Status para {model_name}: {response.status_code}")
+            print(f"-> [LOG 2.2.{index}] HTTP Status clásico para {model_name}: {response.status_code}")
             if response.status_code != 200:
                 print(f"🚨 [LOG 2.3.{index} ERROR]: {response.text}")
-                print(f"-> [LOG 2.4.{index}] Modelo {model_name} falló. Pasando al siguiente en la cadena...")
-                continue # Salta al siguiente modelo de la lista
+                print(f"-> [LOG 2.4.{index}] Modelo {model_name} falló. Pasando al siguiente...")
+                continue
 
-            result_json = response.json()
-            content = result_json["choices"][0]["message"]["content"].strip()
-            print(f"-> [LOG 2.5.{index}] Respuesta exitosa de {model_name}: {content}")
+            resp_data = response.json()
+            
+            # Manejar posibles estructuras de respuesta de la API clásica (texto o lista de choices)
+            content = ""
+            if isinstance(resp_data, list) and len(resp_data) > 0:
+                if "generated_text" in resp_data[0]:
+                    content = resp_data[0]["generated_text"]
+                elif "choices" in resp_data[0]:
+                    content = resp_data[0]["choices"][0]["message"]["content"]
+            elif isinstance(resp_data, dict):
+                if "choices" in resp_data:
+                    content = resp_data["choices"][0]["message"]["content"]
+                elif "generated_text" in resp_data:
+                    content = resp_data["generated_text"]
+
+            if not content:
+                content = json.dumps(resp_data)
+
+            print(f"-> [LOG 2.5.{index}] Respuesta obtenida de {model_name}: {content}")
             
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()
@@ -98,14 +118,14 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
                 pixel_ymax = int((ymax / 1000.0) * original_h)
                 pixel_xmax = int((xmax / 1000.0) * original_w)
                 
-                print(f"-> [LOG 2.6] ¡Éxito con el modelo {model_name}! Coordenadas: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
+                print(f"-> [LOG 2.6] ¡Éxito con el modelo clásico {model_name}! Coordenadas: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
                 return [pixel_ymin, pixel_xmin, pixel_ymax, pixel_xmax]
 
         except Exception as e:
-            print(f"🚨 [LOG 2.7 Excepción con modelo {model_name}]: {str(e)}")
+            print(f"🚨 [LOG 2.7 Excepción con modelo clásico {model_name}]: {str(e)}")
             continue
 
-    print("🚨 [LOG 2.8 ALERTA TOTAL] Todos los modelos de la cadena fallaron.")
+    print("🚨 [LOG 2.8 ALERTA TOTAL] Todos los modelos clásicos fallaron.")
     return None
 
 def process_document_with_hf(image_bytes: bytes) -> Image.Image:
@@ -133,9 +153,9 @@ def process_document_with_hf(image_bytes: bytes) -> Image.Image:
             x2 = min(original_w, xmax - margin_x)
             
             cropped_doc = img[y1:y2, x1:x2]
-            print("-> [LOG 4.2] Recorte milimétrico aplicado con éxito usando la cadena inteligente.")
+            print("-> [LOG 4.2] Recorte milimétrico aplicado con éxito.")
         else:
-            print("🚨 [LOG 4.3 ALERTA] Ningún modelo de IA respondió. Usando respaldo de emergencia (Margen 4%).")
+            print("🚨 [LOG 4.3 ALERTA] Usando respaldo de emergencia (Margen 4%).")
             crop_y = int(original_h * 0.04)
             crop_x = int(original_w * 0.04)
             cropped_doc = img[crop_y:original_h-crop_y, crop_x:original_w-crop_x]
@@ -214,7 +234,7 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> [LOG 5.4] Imagen {index+1} vertical. Enviando a cadena de visión...")
+                    print(f"-> [LOG 5.4] Imagen {index+1} vertical. Enviando a cadena clásica de visión...")
                     clean_doc = process_document_with_hf(image_bytes)
                     pil_images.append(clean_doc)
                 
@@ -246,7 +266,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado con cadena multi-modelo en cascada."
+            "message": "PDF generado con motor clásico de Hugging Face."
         }
 
     except HTTPException as he:
