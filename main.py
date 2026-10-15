@@ -10,21 +10,35 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Router HF Vision Engine", version="17.0")
+app = FastAPI(title="CLAWFLOW Dynamic HF Vision Engine", version="18.0")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-
-# Modelos en cascada usando el router oficial de Hugging Face
-VISION_MODELS_CANDIDATES = [
-    "meta-llama/Llama-3.2-11B-Vision-Instruct",
-    "Qwen/Qwen2-VL-7B-Instruct",
-    "microsoft/Phi-3-vision-128k-instruct"
-]
 
 @app.get("/")
 def health_check():
     token_status = "CONFIGURADA (Longitud: " + str(len(HF_TOKEN)) + ")" if HF_TOKEN else "NO CONFIGURADA ❌"
-    return {"status": "online", "service": "CLAWFLOW Router HF Vision Engine Active", "hf_token_status": token_status}
+    
+    # Comprobación dinámica de modelos disponibles en la cuenta
+    available_vision_models = []
+    if HF_TOKEN:
+        try:
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+            # Consultamos los modelos soportados por el router de la cuenta
+            resp = requests.get("https://router.huggingface.co/v1/models", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                # Extraer IDs de modelos disponibles
+                models_list = data.get("data", [])
+                available_vision_models = [m.get("id") for m in models_list if any(k in m.get("id", "").lower() for k in ["vision", "instruct", "vl"])]
+        except Exception as e:
+            available_vision_models = [f"Error consultando: {str(e)}"]
+
+    return {
+        "status": "online", 
+        "service": "CLAWFLOW Dynamic HF Vision Engine Active", 
+        "hf_token_status": token_status,
+        "active_models_detected_on_account": available_vision_models
+    }
 
 def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h: int) -> list:
     if not HF_TOKEN:
@@ -37,7 +51,6 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
         "Content-Type": "application/json"
     }
 
-    # Endpoint oficial del router compatible con OpenAI
     api_url = "https://router.huggingface.co/v1/chat/completions"
 
     prompt_text = (
@@ -47,9 +60,30 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
         "{\"box_2d\": [ymin, xmin, ymax, xmax]} donde los valores estén en una escala de 0 a 1000."
     )
 
-    for index, model_name in enumerate(VISION_MODELS_CANDIDATES):
+    # Autodescubrimiento dinámico: Intentamos primero consultar los modelos activos en la cuenta
+    dynamic_candidates = [
+        "meta-llama/Llama-3.2-11B-Vision-Instruct",
+        "Qwen/Qwen2-VL-7B-Instruct",
+        "microsoft/Phi-3-vision-128k-instruct"
+    ]
+    
+    try:
+        resp_models = requests.get("https://router.huggingface.co/v1/models", headers=headers, timeout=5)
+        if resp_models.status_code == 200:
+            data = resp_models.json()
+            account_models = [m.get("id") for m in data.get("data", [])]
+            if account_models:
+                # Priorizar los modelos de la cuenta si existen, combinándolos con los nuestros
+                print(f"-> [LOG 2.0.1] Modelos detectados dinámicamente en la cuenta: {account_models[:5]}")
+                for am in account_models:
+                    if any(k in am.lower() for k in ["vision", "vl", "llama-3.2"]) and am not in dynamic_candidates:
+                        dynamic_candidates.insert(0, am)
+    except Exception as ex:
+        print(f"-> [LOG 2.0.2] Aviso en autodescubrimiento de modelos: {str(ex)}")
+
+    for index, model_name in enumerate(dynamic_candidates):
         try:
-            print(f"-> [LOG 2.1.{index}] Intentando con router oficial para [{model_name}]...")
+            print(f"-> [LOG 2.1.{index}] Intentando con modelo dinámico [{model_name}]...")
             
             payload = {
                 "model": model_name,
@@ -73,15 +107,14 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
 
             response = requests.post(api_url, headers=headers, json=payload, timeout=25)
             
-            print(f"-> [LOG 2.2.{index}] HTTP Status del router para {model_name}: {response.status_code}")
+            print(f"-> [LOG 2.2.{index}] HTTP Status para {model_name}: {response.status_code}")
             if response.status_code != 200:
                 print(f"🚨 [LOG 2.3.{index} ERROR BODY]: {response.text}")
-                print(f"-> [LOG 2.4.{index}] Modelo {model_name} falló. Pasando al siguiente en la cadena...")
                 continue
 
             result_json = response.json()
             content = result_json["choices"][0]["message"]["content"].strip()
-            print(f"-> [LOG 2.5.{index}] Respuesta obtenida de {model_name}: {content}")
+            print(f"-> [LOG 2.5.{index}] Respuesta exitosa de {model_name}: {content}")
             
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()
@@ -98,14 +131,14 @@ def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h
                 pixel_ymax = int((ymax / 1000.0) * original_h)
                 pixel_xmax = int((xmax / 1000.0) * original_w)
                 
-                print(f"-> [LOG 2.6] ¡Éxito con el modelo {model_name}! Coordenadas: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
+                print(f"-> [LOG 2.6] ¡Éxito con el modelo dinámico {model_name}! Coordenadas: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
                 return [pixel_ymin, pixel_xmin, pixel_ymax, pixel_xmax]
 
         except Exception as e:
             print(f"🚨 [LOG 2.7 Excepción con modelo {model_name}]: {str(e)}")
             continue
 
-    print("🚨 [LOG 2.8 ALERTA TOTAL] Todos los modelos del router fallaron.")
+    print("🚨 [LOG 2.8 ALERTA TOTAL] Todos los modelos dinámicos fallaron. Activando respaldo geométrico.")
     return None
 
 def process_document_with_hf(image_bytes: bytes) -> Image.Image:
@@ -133,7 +166,7 @@ def process_document_with_hf(image_bytes: bytes) -> Image.Image:
             x2 = min(original_w, xmax - margin_x)
             
             cropped_doc = img[y1:y2, x1:x2]
-            print("-> [LOG 4.2] Recorte milimétrico aplicado con éxito usando el router.")
+            print("-> [LOG 4.2] Recorte milimétrico aplicado con éxito.")
         else:
             print("🚨 [LOG 4.3 ALERTA] Usando respaldo de emergencia (Margen 4%).")
             crop_y = int(original_h * 0.04)
@@ -214,7 +247,7 @@ async def process_bol(payload: BOLRequest):
                     color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
                     pil_images.append(color_image)
                 else:
-                    print(f"-> [LOG 5.4] Imagen {index+1} vertical. Enviando al router oficial de visión...")
+                    print(f"-> [LOG 5.4] Imagen {index+1} vertical. Enviando al motor dinámico de visión...")
                     clean_doc = process_document_with_hf(image_bytes)
                     pil_images.append(clean_doc)
                 
@@ -246,7 +279,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado utilizando el router oficial de Hugging Face."
+            "message": "PDF generado con autodescubrimiento dinámico de Hugging Face."
         }
 
     except HTTPException as he:
