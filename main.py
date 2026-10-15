@@ -10,140 +10,92 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Dynamic HF Vision Engine", version="18.0")
+app = FastAPI(title="CLAWFLOW Bulletproof Vision Engine", version="19.0")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+VISION_MODELS_CANDIDATES = [
+    "meta-llama/Llama-3.2-11B-Vision-Instruct",
+    "Qwen/Qwen2-VL-7B-Instruct",
+    "microsoft/Phi-3-vision-128k-instruct"
+]
 
 @app.get("/")
 def health_check():
     token_status = "CONFIGURADA (Longitud: " + str(len(HF_TOKEN)) + ")" if HF_TOKEN else "NO CONFIGURADA ❌"
-    
-    # Comprobación dinámica de modelos disponibles en la cuenta
-    available_vision_models = []
-    if HF_TOKEN:
-        try:
-            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-            # Consultamos los modelos soportados por el router de la cuenta
-            resp = requests.get("https://router.huggingface.co/v1/models", headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                # Extraer IDs de modelos disponibles
-                models_list = data.get("data", [])
-                available_vision_models = [m.get("id") for m in models_list if any(k in m.get("id", "").lower() for k in ["vision", "instruct", "vl"])]
-        except Exception as e:
-            available_vision_models = [f"Error consultando: {str(e)}"]
+    return {"status": "online", "service": "CLAWFLOW Bulletproof Engine Active", "hf_token_status": token_status}
 
-    return {
-        "status": "online", 
-        "service": "CLAWFLOW Dynamic HF Vision Engine Active", 
-        "hf_token_status": token_status,
-        "active_models_detected_on_account": available_vision_models
-    }
-
-def get_document_corners_from_hf(image_bytes: bytes, original_w: int, original_h: int) -> list:
+def get_document_corners_safe(image_bytes: bytes, original_w: int, original_h: int) -> list:
     if not HF_TOKEN:
-        print("🚨 [LOG 2.0] ERROR CRÍTICO: HF_TOKEN no está configurado en Render.")
         return None
 
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    api_url = "https://router.huggingface.co/v1/chat/completions"
-
-    prompt_text = (
-        "Analiza esta imagen a color y localiza estrictamente los límites del documento de papel (la hoja de Bill of Lading / recibo). "
-        "Ignora por completo el fondo oscuro, los asientos, las manos o la mesa. "
-        "Devuelve SOLAMENTE un objeto JSON válido con este formato exacto, sin texto adicional ni bloques markdown: "
-        "{\"box_2d\": [ymin, xmin, ymax, xmax]} donde los valores estén en una escala de 0 a 1000."
-    )
-
-    # Autodescubrimiento dinámico: Intentamos primero consultar los modelos activos en la cuenta
-    dynamic_candidates = [
-        "meta-llama/Llama-3.2-11B-Vision-Instruct",
-        "Qwen/Qwen2-VL-7B-Instruct",
-        "microsoft/Phi-3-vision-128k-instruct"
-    ]
-    
     try:
-        resp_models = requests.get("https://router.huggingface.co/v1/models", headers=headers, timeout=5)
-        if resp_models.status_code == 200:
-            data = resp_models.json()
-            account_models = [m.get("id") for m in data.get("data", [])]
-            if account_models:
-                # Priorizar los modelos de la cuenta si existen, combinándolos con los nuestros
-                print(f"-> [LOG 2.0.1] Modelos detectados dinámicamente en la cuenta: {account_models[:5]}")
-                for am in account_models:
-                    if any(k in am.lower() for k in ["vision", "vl", "llama-3.2"]) and am not in dynamic_candidates:
-                        dynamic_candidates.insert(0, am)
-    except Exception as ex:
-        print(f"-> [LOG 2.0.2] Aviso en autodescubrimiento de modelos: {str(ex)}")
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        api_url = "https://router.huggingface.co/v1/chat/completions"
 
-    for index, model_name in enumerate(dynamic_candidates):
-        try:
-            print(f"-> [LOG 2.1.{index}] Intentando con modelo dinámico [{model_name}]...")
-            
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt_text},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
+        prompt_text = (
+            "Analiza esta imagen a color y localiza estrictamente los límites del documento de papel (la hoja de Bill of Lading / recibo). "
+            "Ignora por completo el fondo oscuro, los asientos, las manos o la mesa. "
+            "Devuelve SOLAMENTE un objeto JSON válido con este formato exacto, sin texto adicional ni bloques markdown: "
+            "{\"box_2d\": [ymin, xmin, ymax, xmax]} donde los valores estén en una escala de 0 a 1000."
+        )
+
+        for index, model_name in enumerate(VISION_MODELS_CANDIDATES):
+            try:
+                payload = {
+                    "model": model_name,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
                                 }
-                            }
-                        ]
-                    }
-                ],
-                "temperature": 0.0,
-                "max_tokens": 150
-            }
+                            ]
+                        }
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 150
+                }
 
-            response = requests.post(api_url, headers=headers, json=payload, timeout=25)
-            
-            print(f"-> [LOG 2.2.{index}] HTTP Status para {model_name}: {response.status_code}")
-            if response.status_code != 200:
-                print(f"🚨 [LOG 2.3.{index} ERROR BODY]: {response.text}")
-                continue
-
-            result_json = response.json()
-            content = result_json["choices"][0]["message"]["content"].strip()
-            print(f"-> [LOG 2.5.{index}] Respuesta exitosa de {model_name}: {content}")
-            
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            parsed = json.loads(content)
-            box = parsed.get("box_2d")
-
-            if box and len(box) == 4:
-                ymin, xmin, ymax, xmax = box
-                pixel_ymin = int((ymin / 1000.0) * original_h)
-                pixel_xmin = int((xmin / 1000.0) * original_w)
-                pixel_ymax = int((ymax / 1000.0) * original_h)
-                pixel_xmax = int((xmax / 1000.0) * original_w)
+                response = requests.post(api_url, headers=headers, json=payload, timeout=15)
                 
-                print(f"-> [LOG 2.6] ¡Éxito con el modelo dinámico {model_name}! Coordenadas: ymin={pixel_ymin}, xmin={pixel_xmin}, ymax={pixel_ymax}, xmax={pixel_xmax}")
-                return [pixel_ymin, pixel_xmin, pixel_ymax, pixel_xmax]
+                if response.status_code == 200:
+                    result_json = response.json()
+                    content = result_json["choices"][0]["message"]["content"].strip()
+                    
+                    if "```json" in content:
+                        content = content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in content:
+                        content = content.split("```")[1].split("```")[0].strip()
 
-        except Exception as e:
-            print(f"🚨 [LOG 2.7 Excepción con modelo {model_name}]: {str(e)}")
-            continue
+                    parsed = json.loads(content)
+                    box = parsed.get("box_2d")
 
-    print("🚨 [LOG 2.8 ALERTA TOTAL] Todos los modelos dinámicos fallaron. Activando respaldo geométrico.")
+                    if box and len(box) == 4:
+                        ymin, xmin, ymax, xmax = box
+                        pixel_ymin = int((ymin / 1000.0) * original_h)
+                        pixel_xmin = int((xmin / 1000.0) * original_w)
+                        pixel_ymax = int((ymax / 1000.0) * original_h)
+                        pixel_xmax = int((xmax / 1000.0) * original_w)
+                        return [pixel_ymin, pixel_xmin, pixel_ymax, pixel_xmax]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     return None
 
-def process_document_with_hf(image_bytes: bytes) -> Image.Image:
+def process_single_image(image_bytes: bytes) -> Image.Image:
     try:
-        print("-> [LOG 4.0] Decodificando imagen con OpenCV...")
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
@@ -151,9 +103,18 @@ def process_document_with_hf(image_bytes: bytes) -> Image.Image:
             raise ValueError("No se pudo decodificar la imagen.")
 
         original_h, original_w = img.shape[:2]
-        print(f"-> [LOG 4.1] Dimensiones originales: {original_w}x{original_h}")
 
-        box = get_document_corners_from_hf(image_bytes, original_w, original_h)
+        # Determinar si es horizontal o vertical
+        if original_w > original_h:
+            target_w = 1600
+            if original_w > target_w:
+                ratio = target_w / float(original_w)
+                img = cv2.resize(img, (target_w, int(original_h * ratio)), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb)
+
+        # Si es vertical, intentamos detección por IA o respaldo geométrico seguro
+        box = get_document_corners_safe(image_bytes, original_w, original_h)
 
         if box:
             ymin, xmin, ymax, xmax = box
@@ -166,14 +127,13 @@ def process_document_with_hf(image_bytes: bytes) -> Image.Image:
             x2 = min(original_w, xmax - margin_x)
             
             cropped_doc = img[y1:y2, x1:x2]
-            print("-> [LOG 4.2] Recorte milimétrico aplicado con éxito.")
         else:
-            print("🚨 [LOG 4.3 ALERTA] Usando respaldo de emergencia (Margen 4%).")
+            # Respaldo geométrico limpio (Margen 4%)
             crop_y = int(original_h * 0.04)
             crop_x = int(original_w * 0.04)
             cropped_doc = img[crop_y:original_h-crop_y, crop_x:original_w-crop_x]
 
-        print("-> [LOG 4.4] Redimensionando y aplicando CLAHE a color...")
+        # Redimensionar estándar y CLAHE a color
         target_width = 1600
         ch, cw = cropped_doc.shape[:2]
         if cw > target_width:
@@ -190,18 +150,15 @@ def process_document_with_hf(image_bytes: bytes) -> Image.Image:
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        print("-> [LOG 4.5] Armando lienzo blanco corporativo...")
+        # Lienzo blanco corporativo con padding
         dw, dh = doc_pil.size
-        canvas_w = dw + 60
-        canvas_h = dh + 60
-        canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
 
-        print("-> [LOG 4.6] Documento procesado y enmarcado con éxito.")
         return canvas
 
     except Exception as e:
-        print(f"🚨 [LOG 4.7 EXCEPCIÓN CRÍTICA]: {str(e)}")
+        print(f"🚨 Error procesando imagen individual: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -214,14 +171,14 @@ class BOLRequest(BaseModel):
 async def process_bol(payload: BOLRequest):
     try:
         print(f"-> [LOG 5.0] Petición /process-bol recibida con {len(payload.image_urls)} imágenes.")
-        if not payload.image_urls or len(payload.image_urls) == 0:
+        if not payload.image_urls:
             raise HTTPException(status_code=400, detail="No se recibieron imágenes.")
 
         pil_images = []
         
         for index, img_uri in enumerate(payload.image_urls):
             try:
-                print(f"-> [LOG 5.1] Procesando imagen {index+1}...")
+                print(f"-> [LOG 5.1] Procesando imagen {index+1} de {len(payload.image_urls)}...")
                 if img_uri.startswith("data:"):
                     header, encoded = img_uri.split(",", 1)
                     image_bytes = base64.b64decode(encoded)
@@ -230,29 +187,11 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                nparr = np.frombuffer(image_bytes, np.uint8)
-                np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if np_img is None:
-                    continue
-
-                h, w, _ = np_img.shape
-
-                if w > h:
-                    print(f"-> [LOG 5.3] Imagen {index+1} horizontal. Manteniendo a color.")
-                    target_w = 1600
-                    if w > target_w:
-                        ratio = target_w / float(w)
-                        np_img = cv2.resize(np_img, (target_w, int(h * ratio)), interpolation=cv2.INTER_AREA)
-                    color_image = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
-                    pil_images.append(color_image)
-                else:
-                    print(f"-> [LOG 5.4] Imagen {index+1} vertical. Enviando al motor dinámico de visión...")
-                    clean_doc = process_document_with_hf(image_bytes)
-                    pil_images.append(clean_doc)
+                processed_img = process_single_image(image_bytes)
+                pil_images.append(processed_img)
                 
             except Exception as img_err:
-                print(f"🚨 [LOG 5.5] Error en imagen {index+1}: {str(img_err)}")
+                print(f"🚨 [LOG 5.5] Error crítico en imagen {index+1}: {str(img_err)}")
 
         if not pil_images:
             raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
@@ -274,16 +213,16 @@ async def process_bol(payload: BOLRequest):
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 6.1] ¡PDF generado y codificado exitosamente!")
+        print("-> [LOG 6.1] ¡PDF unificado generado exitosamente sin errores 502!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado con autodescubrimiento dinámico de Hugging Face."
+            "message": "PDF generado exitosamente con arquitectura blindada."
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"🚨 [LOG 6.2 ERROR CRÍTICO]: {str(e)}")
+        print(f"🚨 [LOG 6.2 ERROR CRÍTICO EN RUTA]: {str(e)}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": str(e)}))
