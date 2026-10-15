@@ -1,7 +1,7 @@
 import io
 import json
 import base64
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import requests
@@ -10,14 +10,43 @@ import cv2
 from PIL import Image
 import os
 
-app = FastAPI(title="CLAWFLOW Smart Division Engine", version="12.1")
+app = FastAPI(title="CLAWFLOW Dynamic Vision Engine", version="13.0")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 @app.get("/")
 def health_check():
     key_status = "CONFIGURADA (Longitud: " + str(len(GROQ_API_KEY)) + ")" if GROQ_API_KEY else "NO CONFIGURADA ❌"
-    return {"status": "online", "service": "CLAWFLOW Smart Division Engine Active", "groq_key_status": key_status}
+    return {"status": "online", "service": "CLAWFLOW Dynamic Vision Engine Active", "groq_key_status": key_status}
+
+def get_active_vision_model() -> str:
+    """
+    Consulta dinámicamente a la API de Groq los modelos disponibles en tiempo real
+    y selecciona automáticamente el mejor modelo de visión activo.
+    """
+    default_fallback = "llama-3.2-11b-vision-preview"
+    
+    if not GROQ_API_KEY:
+        return default_fallback
+
+    try:
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        response = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            models_data = response.json().get("data", [])
+            # Buscar modelos que contengan 'vision' en su ID
+            vision_models = [m["id"] for m in models_data if "vision" in m["id"].lower() and m.get("active", True)]
+            
+            if vision_models:
+                # Priorizar el modelo de 11b o el primero disponible que encuentre
+                selected = next((m for m in vision_models if "11b" in m), vision_models[0])
+                print(f"-> [Dinámico] Modelo de visión seleccionado automáticamente: {selected}")
+                return selected
+    except Exception as e:
+        print(f"⚠️ No se pudo consultar la lista de modelos dinámicos: {str(e)}. Usando respaldo: {default_fallback}")
+
+    return default_fallback
 
 def get_document_corners_from_groq(image_bytes: bytes, original_w: int, original_h: int) -> list:
     if not GROQ_API_KEY:
@@ -25,7 +54,10 @@ def get_document_corners_from_groq(image_bytes: bytes, original_w: int, original
         return None
 
     try:
-        print("-> [Groq Vision] Preparando petición HTTP a Groq...")
+        # Descubrir dinámicamente qué modelo de visión está activo hoy
+        active_model = get_active_vision_model()
+        
+        print(f"-> [Groq Vision] Usando modelo dinámico: {active_model}")
         base64_image = base64.b64encode(image_bytes).decode("utf-8")
         
         headers = {
@@ -44,7 +76,7 @@ def get_document_corners_from_groq(image_bytes: bytes, original_w: int, original
         )
 
         payload = {
-            "model": "llama-3.2-90b-vision-preview",
+            "model": active_model,
             "messages": [
                 {
                     "role": "user",
@@ -233,7 +265,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado con logs de diagnóstico."
+            "message": "PDF generado con descubrimiento dinámico de modelos de visión."
         }
 
     except HTTPException as he:
