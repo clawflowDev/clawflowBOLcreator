@@ -9,14 +9,14 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Robust Document Warp Engine", version="23.0")
+app = FastAPI(title="CLAWFLOW Precision Warp & Symmetric Crop Engine", version="24.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Robust Document Warp Engine Active",
-        "mode": "Adaptive Perspective Warp + Fallback Perimetric Crop"
+        "service": "CLAWFLOW Precision Warp & Symmetric Crop Engine Active",
+        "mode": "Symmetric Vertical & Horizontal Perimetric Crop + Warp"
     }, 200
 
 def order_points(pts):
@@ -78,7 +78,7 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
             return Image.fromarray(rgb_img)
 
         # -------------------------------------------------------------
-        # DETECCIÓN ADAPTATIVA (WARP + RECÓRTE PERIMETRAL SEGURO)
+        # DETECCIÓN ADAPTATIVA CON RECORTE VERTICAL Y HORIZONTAL SIMÉTRICO
         # -------------------------------------------------------------
         print("-> [LOG 4.3] Buscando esquinas y contorno del documento...")
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -95,8 +95,7 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
             
             area = cv2.contourArea(c)
-            # Aceptar contornos de 4 esquinas que ocupen entre el 20% y el 95% de la foto
-            if len(approx) == 4 and (original_h * original_w * 0.20) < area < (original_h * original_w * 0.95):
+            if len(approx) == 4 and (original_h * original_w * 0.18) < area < (original_h * original_w * 0.96):
                 screenCnt = approx
                 break
 
@@ -104,9 +103,9 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
             print("-> [LOG 4.4] ¡Contorno de 4 esquinas detectado con éxito! Aplicando Warp...")
             warped = four_point_transform(img, screenCnt.reshape(4, 2))
         else:
-            print("-> [LOG 4.4 WARNING] Contorno no cerrado. Aplicando recorte perimetral inteligente del 5% para eliminar fondo.")
-            # Recorte de seguridad del 5% en cada lado para garantizar que la página 3 elimine el fondo oscuro o mesa
-            crop_y = int(original_h * 0.05)
+            print("-> [LOG 4.4 WARNING] Contorno no cerrado. Aplicando recorte perimetral simétrico robusto (7% vertical, 5% horizontal).")
+            # Aumentamos el margen superior e inferior (7%) para asegurar que limpie el top y bottom de la página 3
+            crop_y = int(original_h * 0.07)
             crop_x = int(original_w * 0.05)
             warped = img[crop_y:original_h-crop_y, crop_x:original_w-crop_x]
 
@@ -133,7 +132,7 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
 
-        print("-> [LOG 4.5] Documento procesado, recortado y enmarcado con éxito.")
+        print("-> [LOG 4.5] Documento procesado, recortado simétricamente y enmarcado con éxito.")
         return canvas
 
     except Exception as e:
@@ -195,7 +194,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente con respaldo de recorte perimetral adaptativo."
+            "message": "PDF generado con éxito con recorte vertical y horizontal simétrico."
         }
 
     except HTTPException as he:
