@@ -8,132 +8,81 @@ import requests
 import numpy as np
 import cv2
 from PIL import Image
-import os
 
-app = FastAPI(title="CLAWFLOW Bulletproof Vision Engine", version="19.0")
-
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-
-VISION_MODELS_CANDIDATES = [
-    "meta-llama/Llama-3.2-11B-Vision-Instruct",
-    "Qwen/Qwen2-VL-7B-Instruct",
-    "microsoft/Phi-3-vision-128k-instruct"
-]
+app = FastAPI(title="CLAWFLOW Ink Density & Margin Engine", version="21.0")
 
 @app.get("/")
 def health_check():
-    token_status = "CONFIGURADA (Longitud: " + str(len(HF_TOKEN)) + ")" if HF_TOKEN else "NO CONFIGURADA ❌"
-    return {"status": "online", "service": "CLAWFLOW Bulletproof Engine Active", "hf_token_status": token_status}
+    return {
+        "status": "online", 
+        "service": "CLAWFLOW Ink Density Engine Active",
+        "mode": "1cm Margin Post-Ink Detection + A4 Canvas"
+    }
 
-def get_document_corners_safe(image_bytes: bytes, original_w: int, original_h: int) -> list:
-    if not HF_TOKEN:
-        return None
-
+def process_image_by_ink_density(image_bytes: bytes) -> Image.Image:
     try:
-        base64_image = base64.b64encode(image_bytes).decode("utf-8")
-        headers = {
-            "Authorization": f"Bearer {HF_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        api_url = "https://router.huggingface.co/v1/chat/completions"
-
-        prompt_text = (
-            "Analiza esta imagen a color y localiza estrictamente los límites del documento de papel (la hoja de Bill of Lading / recibo). "
-            "Ignora por completo el fondo oscuro, los asientos, las manos o la mesa. "
-            "Devuelve SOLAMENTE un objeto JSON válido con este formato exacto, sin texto adicional ni bloques markdown: "
-            "{\"box_2d\": [ymin, xmin, ymax, xmax]} donde los valores estén en una escala de 0 a 1000."
-        )
-
-        for index, model_name in enumerate(VISION_MODELS_CANDIDATES):
-            try:
-                payload = {
-                    "model": model_name,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{base64_image}"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 150
-                }
-
-                response = requests.post(api_url, headers=headers, json=payload, timeout=15)
-                
-                if response.status_code == 200:
-                    result_json = response.json()
-                    content = result_json["choices"][0]["message"]["content"].strip()
-                    
-                    if "```json" in content:
-                        content = content.split("```json")[1].split("```")[0].strip()
-                    elif "```" in content:
-                        content = content.split("```")[1].split("```")[0].strip()
-
-                    parsed = json.loads(content)
-                    box = parsed.get("box_2d")
-
-                    if box and len(box) == 4:
-                        ymin, xmin, ymax, xmax = box
-                        pixel_ymin = int((ymin / 1000.0) * original_h)
-                        pixel_xmin = int((xmin / 1000.0) * original_w)
-                        pixel_ymax = int((ymax / 1000.0) * original_h)
-                        pixel_xmax = int((xmax / 1000.0) * original_w)
-                        return [pixel_ymin, pixel_xmin, pixel_ymax, pixel_xmax]
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return None
-
-def process_single_image(image_bytes: bytes) -> Image.Image:
-    try:
+        print("-> [LOG 4.0] Decodificando imagen con OpenCV...")
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            raise ValueError("No se pudo decodificar la imagen.")
+            raise ValueError("No se pudo decodificar la imagen binaria.")
 
         original_h, original_w = img.shape[:2]
+        print(f"-> [LOG 4.1] Dimensiones originales: {original_w}x{original_h} px")
 
-        # Determinar si es horizontal o vertical
+        # Si la imagen es claramente horizontal (fotos de la carga/remolque), la dejamos intacta a color
         if original_w > original_h:
+            print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color sin recortes...")
             target_w = 1600
             if original_w > target_w:
                 ratio = target_w / float(original_w)
                 img = cv2.resize(img, (target_w, int(original_h * ratio)), interpolation=cv2.INTER_AREA)
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            return Image.fromarray(rgb)
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb_img)
 
-        # Si es vertical, intentamos detección por IA o respaldo geométrico seguro
-        box = get_document_corners_safe(image_bytes, original_w, original_h)
+        # -------------------------------------------------------------
+        # DETECCIÓN BASADA EN DENSIDAD DE TINTA Y ELEMENTOS GRÁFICOS
+        # -------------------------------------------------------------
+        print("-> [LOG 4.3] Analizando límites de tinta y elementos gráficos...")
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        if box:
-            ymin, xmin, ymax, xmax = box
-            margin_y = int((ymax - ymin) * 0.01)
-            margin_x = int((xmax - xmin) * 0.01)
-            
-            y1 = max(0, ymin + margin_y)
-            x1 = max(0, xmin + margin_x)
-            y2 = min(original_h, ymax - margin_y)
-            x2 = min(original_w, xmax - margin_x)
-            
+        # Aplicamos un umbral para resaltar los elementos oscuros (texto, líneas, sellos)
+        # Binarización invertida: Tinta = Blanco (255), Fondo = Negro (0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Encontrar todas las coordenadas donde hay tinta / elementos gráficos
+        points = cv2.findNonZero(thresh)
+
+        if points is not None:
+            # Obtener el rectángulo delimitador exacto de la tinta
+            x, y, w, h = cv2.boundingRect(points)
+            print(f"-> [LOG 4.4] Bounding Box de tinta encontrado: x={x}, y={y}, w={w}, h={h}")
+
+            # ---------------------------------------------------------
+            # CÁLCULO DINÁMICO DE 1 CM DE MARGEN (PADDING)
+            # ---------------------------------------------------------
+            # Asumiendo una resolución promedio estándar de 150 a 300 DPI en fotos de móvil:
+            # 1 pulgada = 2.54 cm. Estimamos los px/cm proporcionalmente a la altura de la imagen.
+            px_per_cm = int(original_h / 29.7)  # Basado en la altura de una hoja A4 (~29.7 cm)
+            if px_per_cm < 20:
+                px_per_cm = 30  # Valor mínimo de resguardo
+                
+            print(f"-> [LOG 4.5] Margen de 1 cm calculado: {px_per_cm} píxeles de padding.")
+
+            # Aplicar el margen de 1 cm hacia afuera de los límites de la tinta
+            x1 = max(0, x - px_per_cm)
+            y1 = max(0, y - px_per_cm)
+            x2 = min(original_w, x + w + px_per_cm)
+            y2 = min(original_h, y + h + px_per_cm)
+
             cropped_doc = img[y1:y2, x1:x2]
+            print(f"-> [LOG 4.6] Recorte final aplicado con 1 cm de distancia alrededor de la tinta.")
         else:
-            # Respaldo geométrico limpio (Margen 4%)
-            crop_y = int(original_h * 0.04)
-            crop_x = int(original_w * 0.04)
-            cropped_doc = img[crop_y:original_h-crop_y, crop_x:original_w-crop_x]
+            print("-> [LOG 4.4 WARNING] No se detectó tinta clara. Usando imagen completa sin recorte.")
+            cropped_doc = img
 
-        # Redimensionar estándar y CLAHE a color
+        # Redimensionar estándar y aplicar CLAHE para nitidez de texto
         target_width = 1600
         ch, cw = cropped_doc.shape[:2]
         if cw > target_width:
@@ -141,6 +90,7 @@ def process_single_image(image_bytes: bytes) -> Image.Image:
             new_h = int(ch * ratio)
             cropped_doc = cv2.resize(cropped_doc, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
+        # Realce de contraste CLAHE (resalta la tinta sobre papel arrugado o sombreado)
         lab = cv2.cvtColor(cropped_doc, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -150,15 +100,16 @@ def process_single_image(image_bytes: bytes) -> Image.Image:
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        # Lienzo blanco corporativo con padding
+        # Lienzo blanco corporativo con margen estético adicional
         dw, dh = doc_pil.size
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
 
+        print("-> [LOG 4.7] Documento enmarcado exitosamente sobre lienzo corporativo.")
         return canvas
 
     except Exception as e:
-        print(f"🚨 Error procesando imagen individual: {str(e)}")
+        print(f"🚨 [LOG 4.8 ERROR EN PROCESAMIENTO LOCAL]: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -172,7 +123,7 @@ async def process_bol(payload: BOLRequest):
     try:
         print(f"-> [LOG 5.0] Petición /process-bol recibida con {len(payload.image_urls)} imágenes.")
         if not payload.image_urls:
-            raise HTTPException(status_code=400, detail="No se recibieron imágenes.")
+            raise HTTPException(status_code=400, detail="No se recibieron URLs de imágenes.")
 
         pil_images = []
         
@@ -187,16 +138,16 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                processed_img = process_single_image(image_bytes)
-                pil_images.append(processed_img)
+                processed_page = process_image_by_ink_density(image_bytes)
+                pil_images.append(processed_page)
                 
             except Exception as img_err:
-                print(f"🚨 [LOG 5.5] Error crítico en imagen {index+1}: {str(img_err)}")
+                print(f"🚨 [LOG 5.5] Error procesando imagen {index+1}: {str(img_err)}")
 
         if not pil_images:
             raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
 
-        print("-> [LOG 6.0] Compilando PDF final unificado...")
+        print("-> [LOG 6.0] Compilando PDF final unificado en alta resolución...")
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -213,16 +164,16 @@ async def process_bol(payload: BOLRequest):
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 6.1] ¡PDF unificado generado exitosamente sin errores 502!")
+        print("-> [LOG 6.1] ¡PDF unificado generado exitosamente sin pérdidas de contenido!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente con arquitectura blindada."
+            "message": "PDF generado con éxito usando detección de tinta y padding de 1cm."
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"🚨 [LOG 6.2 ERROR CRÍTICO EN RUTA]: {str(e)}")
+        print(f"🚨 [LOG 6.2 ERROR CRÍTICO]: {str(e)}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": str(e)}))
