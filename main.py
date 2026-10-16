@@ -9,18 +9,18 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Sheet Isolation Engine", version="36.0")
+app = FastAPI(title="CLAWFLOW Universal Isolation Engine", version="38.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Sheet Isolation Engine Active",
-        "mode": "White Sheet Isolation + Outer Boundary Perspective Warp"
+        "service": "CLAWFLOW Universal 5-Layer Engine Active",
+        "mode": "Sheet Isolation + Convex Hull + MinAreaRect + CLAHE Dynamic"
     }, 200
 
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """Ordena 4 puntos: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
+    """Ordena 4 puntos en sentido horario: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -32,7 +32,7 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Transformación de perspectiva basada en la masa real de la hoja"""
+    """Aplica la transformación de perspectiva matemática sin deformar proporciones"""
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
 
@@ -44,6 +44,7 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
 
+    # Limites mínimos para preservar resolución A4 estandarizada
     maxWidth = max(maxWidth, 1000)
     maxHeight = max(maxHeight, 1400)
 
@@ -57,55 +58,59 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def get_paper_sheet_corners(img: np.ndarray) -> np.ndarray:
+def extract_universal_paper_corners(img: np.ndarray) -> np.ndarray:
     """
-    Aísla la MASA BLANCA completa de la hoja de papel (evita engancharse con tablas internas).
+    IMPLEMENTACIÓN DE CAPAS 1 A 4:
+    Aísla la masa luminosa de la hoja completa ignorando tablas internas,
+    hojas apiladas debajo ("milhojas") y sombras parciales.
     """
     h, w = img.shape[:2]
     total_area = h * w
-    
-    # 1. Escala de grises + Blur para uniformar la luz del papel
+
+    # CAPA 1: Escala de Grises + Blur Intenso para unificar reflectancia
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+    blurred = cv2.GaussianBlur(gray, (13, 13), 0)
 
-    # 2. Umbralizado de Otsu para separar Fondo vs Papel (Masa Clara)
+    # Binarización de Otsu para separar Papel (Brillante) vs Fondo (Oscuro)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Si la imagen tiene el fondo predominantemente oscuro y la hoja clara
+    
+    # Invertir si el fondo resultara blanco por algún reflejo extraño
     if np.mean(thresh) < 127:
         thresh = cv2.bitwise_not(thresh)
 
-    # 3. Limpieza morfológica para fusionar todo el texto/tablas en un solo bloque blanco solido
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+    # CAPA 2: Cierre Morfológico con Kernel Grande (25x25)
+    # Rellena cajas, textos, firmas y pega las hojas de atrás como una sola masa
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-    # 4. Encontrar el contorno EXTERNO más grande (la hoja entera)
+    # Obtener el contorno externo más grande
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     for c in contours:
         area = cv2.contourArea(c)
-        if area > (total_area * 0.25):
-            # Envolvente convexa para tapar hendiduras o firmas que sobresalgan
+        # Si la masa ocupa al menos el 20% de la foto
+        if area > (total_area * 0.20):
+            # CAPA 3: Convex Hull (Elimina ondulaciones y esquinas arrugadas)
             hull = cv2.convexHull(c)
-            
-            # Aproximar a un polígono de 4 esquinas
+
+            # Intentar polígono directo de 4 esquinas
             peri = cv2.arcLength(hull, True)
             approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
 
             if len(approx) == 4:
-                print("-> [ISOLATION LOG] Hoja completa aislada con 4 esquinas externas.")
+                print("-> [ENGINE LOG] Capa 3: 4 Esquinas directas extraídas de la masa de papel.")
                 return approx.reshape(4, 2).astype("float32")
-            
-            # Si tiene más de 4 esquinas por arrugas, extraemos el Bounding Box Rotado
+
+            # CAPA 4: Si hay más de 4 puntos por arrugas, extrae el Bounding Box Rotado Mínimo
             rect = cv2.minAreaRect(hull)
             box = cv2.boxPoints(rect)
-            print("-> [ISOLATION LOG] Hoja aislada mediante rectángulo envolvente mínimo.")
+            print("-> [ENGINE LOG] Capa 4: 4 Esquinas calculadas vía MinAreaRect envolvente.")
             return box.astype("float32")
 
-    # Resguardo calibrado si no hay contraste con el fondo
-    print("-> [ISOLATION WARNING] Sin contraste exterior. Aplicando resguardo perimetral del 3%.")
-    mx, my = int(w * 0.03), int(h * 0.03)
+    # Resguardo proporcional si no existe contraste (ej. hoja blanca sobre mesa blanca)
+    print("-> [ENGINE WARNING] Sin contraste suficiente con el fondo. Aplicando resguardo perimetral 2.5%.")
+    mx, my = int(w * 0.025), int(h * 0.025)
     return np.array([
         [mx, my],
         [w - mx, my],
@@ -119,36 +124,44 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            raise ValueError("No se pudo decodificar la imagen.")
+            raise ValueError("No se pudo decodificar la imagen binaria.")
 
         original_h, original_w = img.shape[:2]
 
-        # Mantenemos intactas las fotos horizontales (cargas/remolques)
+        # 🛡️ PROTECCIÓN ANTI-OOM (502): Reducción preventiva a max 1600px
+        max_dimension = 1600
+        if original_w > max_dimension or original_h > max_dimension:
+            scaling_factor = max_dimension / float(max(original_w, original_h))
+            new_w = int(original_w * scaling_factor)
+            new_h = int(original_h * scaling_factor)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            original_h, original_w = img.shape[:2]
+
+        # Tratamiento de imágenes horizontales (Fotos de remolques / carga)
         if original_w > original_h:
-            print("-> [LOG] Imagen horizontal. Preservando a color...")
-            target_w = 1600
-            if original_w > target_w:
-                ratio = target_w / float(original_w)
-                img = cv2.resize(img, (target_w, int(original_h * ratio)), interpolation=cv2.INTER_AREA)
+            print("-> [ENGINE LOG] Imagen horizontal detectada. Preservando original...")
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return Image.fromarray(rgb_img)
 
-        # 1. Obtener esquinas de la MASA COMPLETA DEL PAPEL
-        corner_points = get_paper_sheet_corners(img)
+        # 1 a 4. Extracción de las 4 esquinas de la masa completa
+        corner_points = extract_universal_paper_corners(img)
 
-        # 2. Transformación de perspectiva
+        # Transformación de perspectiva
         warped = four_point_transform(img, corner_points)
 
-        # 3. Estandarización de tamaño
-        target_width = 1600
+        # Estandarización de tamaño (Ancho objetivo 1500px para nitidez de impresión)
+        target_width = 1500
         ch, cw = warped.shape[:2]
         if cw != target_width:
             ratio = target_width / float(cw)
             new_h = int(ch * ratio)
             warped = cv2.resize(warped, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        # 4. Realce de legibilidad CLAHE
+        # CAPA 5: Restauración de Tinta y Remoción de Sombras
+        # 5.1 Filtro Bilateral: Mantiene bordes de tinta afilados mientras suaviza la textura del papel
         smoothed = cv2.bilateralFilter(warped, 9, 75, 75)
+
+        # 5.2 Normalización de Iluminación Local (CLAHE en espacio LAB)
         lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
@@ -158,7 +171,7 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        # 5. Enmarcado A4
+        # Lienzo A4 Corporativo con margen de resguardo de 30px
         dw, dh = doc_pil.size
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
@@ -166,7 +179,7 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         return canvas
 
     except Exception as e:
-        print(f"🚨 [LOG ERROR]: {str(e)}")
+        print(f"🚨 [ENGINE ERROR]: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -178,12 +191,14 @@ class BOLRequest(BaseModel):
 @app.post("/process-bol")
 async def process_bol(payload: BOLRequest):
     try:
+        print(f"-> [LOG 1.0] Petición /process-bol recibida. Procesando {len(payload.image_urls)} imágenes.")
         if not payload.image_urls:
-            raise HTTPException(status_code=400, detail="Sin imágenes en payload.")
+            raise HTTPException(status_code=400, detail="No se recibieron imágenes en el payload.")
 
         pil_images = []
         for index, img_uri in enumerate(payload.image_urls):
             try:
+                print(f"-> [LOG 1.1] Procesando imagen {index+1} de {len(payload.image_urls)}...")
                 if img_uri.startswith("data:"):
                     header, encoded = img_uri.split(",", 1)
                     image_bytes = base64.b64decode(encoded)
@@ -195,11 +210,12 @@ async def process_bol(payload: BOLRequest):
                 processed_page = process_document_pipeline(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
-                print(f"🚨 [ERROR IMG {index+1}]: {str(img_err)}")
+                print(f"🚨 [LOG ERROR] Error procesando imagen {index+1}: {str(img_err)}")
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="Sin páginas procesadas.")
+            raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
 
+        print("-> [LOG 2.0] Compilando PDF final unificado...")
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -209,21 +225,23 @@ async def process_bol(payload: BOLRequest):
             format="PDF",
             save_all=True,
             append_images=remaining_images,
-            quality=92,
+            quality=90,
             optimize=True
         )
         
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
+        print("-> [LOG 2.1] ¡PDF unificado generado exitosamente con el motor de 5 capas!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF procesado con aislamiento de masa de hoja completa."
+            "message": "PDF generado exitosamente usando Universal Isolation Engine v38.0."
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
+        print(f"🚨 [LOG ERROR CRÍTICO]: {str(e)}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": str(e)}))
