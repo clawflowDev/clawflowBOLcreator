@@ -9,53 +9,17 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Multi-Format BOL Processing Engine", version="25.0")
+app = FastAPI(title="CLAWFLOW Guaranteed Crop Engine", version="26.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Multi-Format BOL Engine Active",
-        "mode": "Adaptive Multi-Strategy Crop + Bilateral Text Enhancement"
+        "service": "CLAWFLOW Guaranteed Crop Engine Active",
+        "mode": "Guaranteed Perimetric Crop + Bilateral CLAHE Enhancement"
     }, 200
 
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image, pts):
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-
-    maxWidth = max(maxWidth, 900)
-    maxHeight = max(maxHeight, 1200)
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
-
-def process_document_multi_strategy(image_bytes: bytes) -> Image.Image:
+def process_document_guaranteed(image_bytes: bytes) -> Image.Image:
     try:
         print("-> [LOG 4.0] Decodificando imagen con OpenCV...")
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -67,9 +31,9 @@ def process_document_multi_strategy(image_bytes: bytes) -> Image.Image:
         original_h, original_w = img.shape[:2]
         print(f"-> [LOG 4.1] Dimensiones originales: {original_w}x{original_h} px")
 
-        # Si la imagen es horizontal (fotos de carga/remolque), la preservamos a color intacta
+        # Si la imagen es horizontal (fotos de la carga/remolque), se preserva a color intacta
         if original_w > original_h:
-            print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color...")
+            print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color sin recortes...")
             target_w = 1600
             if original_w > target_w:
                 ratio = target_w / float(original_w)
@@ -78,55 +42,36 @@ def process_document_multi_strategy(image_bytes: bytes) -> Image.Image:
             return Image.fromarray(rgb_img)
 
         # -------------------------------------------------------------
-        # ESTRATEGIA 1: INTENTO DE PERSPECTIVA (Canny + Contornos)
+        # RECORTE PERIMETRAL GARANTIZADO (ELIMINACIÓN DE FONDOS / MESA)
         # -------------------------------------------------------------
-        print("-> [LOG 4.3] Estrategia 1: Analizando contornos de 4 esquinas...")
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        print("-> [LOG 4.3] Aplicando recorte perimetral simétrico garantizado para páginas verticales...")
         
-        # Filtro bilateral para limpiar ruido de fondo sin perder nitidez en líneas de texto
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-        edged = cv2.Canny(filtered, 40, 150)
+        # Margenes porcentuales precisos para eliminar el fondo de las fotos de WhatsApp en cualquier página
+        # 6% en los laterales (izq/der) y 7% en vertical (arriba/abajo)
+        crop_y_top = int(original_h * 0.07)
+        crop_y_bottom = int(original_h * 0.93)
+        crop_x_left = int(original_w * 0.06)
+        crop_x_right = int(original_w * 0.94)
 
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:20]
-
-        screenCnt = None
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            area = cv2.contourArea(c)
-            # Aceptamos cuadriláteros válidos entre 15% y 97% de la imagen
-            if len(approx) == 4 and (original_h * original_w * 0.15) < area < (original_h * original_w * 0.97):
-                screenCnt = approx
-                break
-
-        if screenCnt is not None:
-            print("-> [LOG 4.4] ¡Cuadrilátero detectado con éxito! Aplicando Warp de perspectiva...")
-            processed_doc = four_point_transform(img, screenCnt.reshape(4, 2))
-        else:
-            # -------------------------------------------------------------
-            # ESTRATEGIA 2: RECORTE PERIMETRAL DINÁMICO REFORZADO (Para página 3 y recibos complejos)
-            # -------------------------------------------------------------
-            print("-> [LOG 4.4 WARNING] Contorno geométrico no cerrado. Activando Estrategia 2: Recorte Perimetral Dinámico Profundo...")
-            
-            # Recortes simétricos agresivos pero seguros (8% arriba/abajo, 6% laterales) para eliminar mesas y fondos oscuros
-            crop_y = int(original_h * 0.08)
-            crop_x = int(original_w * 0.06)
-            processed_doc = img[crop_y:original_h-crop_y, crop_x:original_w-crop_x]
+        cropped_doc = img[crop_y_top:crop_y_bottom, crop_x_left:crop_x_right]
+        print(f"-> [LOG 4.4] Recorte aplicado: de {original_w}x{original_h} a {cropped_doc.shape[1]}x{cropped_doc.shape[0]} px")
 
         # -------------------------------------------------------------
-        # CALIDAD Y NITTIDEZ MÁXIMA (CLAHE + Bilateral Text Enhancement)
+        # ESTANDARIZACIÓN Y REALCE DE TINTA (OCR-READY)
         # -------------------------------------------------------------
-        print("-> [LOG 4.5] Aplicando motor de realce de texto y contraste optimizado...")
+        print("-> [LOG 4.5] Aplicando redimensionamiento y realce CLAHE para máxima nitidez...")
         target_width = 1600
-        ch, cw = processed_doc.shape[:2]
+        ch, cw = cropped_doc.shape[:2]
         if cw != target_width:
             ratio = target_width / float(cw)
             new_h = int(ch * ratio)
-            processed_doc = cv2.resize(processed_doc, (target_width, new_h), interpolation=cv2.INTER_AREA)
+            cropped_doc = cv2.resize(cropped_doc, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        # Conversión a espacio LAB para realzar luminancia (L) aislando el color
-        lab = cv2.cvtColor(processed_doc, cv2.COLOR_BGR2LAB)
+        # Filtro bilateral para suavizar ruidos de fondo manteniendo los textos súper nítidos
+        smoothed = cv2.bilateralFilter(cropped_doc, 9, 75, 75)
+
+        # Espacio de color LAB para destacar la luminancia del texto sobre el papel
+        lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         cl = clahe.apply(l)
@@ -135,12 +80,12 @@ def process_document_multi_strategy(image_bytes: bytes) -> Image.Image:
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        # Lienzo blanco corporativo con margen estético de resguardo de 30px
+        # Enmarcado en lienzo blanco corporativo (30px de margen estético)
         dw, dh = doc_pil.size
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
 
-        print("-> [LOG 4.6] Página procesada, recortada y optimizada exitosamente.")
+        print("-> [LOG 4.6] Página procesada, recortada y enmarcada con éxito.")
         return canvas
 
     except Exception as e:
@@ -172,7 +117,7 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                processed_page = process_document_multi_strategy(image_bytes)
+                processed_page = process_document_guaranteed(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
                 print(f"🚨 [LOG 5.5] Error en imagen {index+1}: {str(img_err)}")
@@ -180,7 +125,7 @@ async def process_bol(payload: BOLRequest):
         if not pil_images:
             raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
 
-        print("-> [LOG 6.0] Compilando PDF final unificado en alta calidad...")
+        print("-> [LOG 6.0] Compilando PDF final unificado...")
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -197,12 +142,12 @@ async def process_bol(payload: BOLRequest):
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 6.1] ¡PDF final generado exitosamente con calidad mejorada!")
+        print("-> [LOG 6.1] ¡PDF generado exitosamente!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente con estrategia multi-formato y realce de lectura."
+            "message": "PDF generado exitosamente con el motor de recorte perimetral garantizado."
         }
 
     except HTTPException as he:
