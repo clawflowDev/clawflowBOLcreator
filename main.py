@@ -9,17 +9,17 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Guaranteed Crop Engine", version="26.0")
+app = FastAPI(title="CLAWFLOW Stable Baseline Engine", version="27.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Guaranteed Crop Engine Active",
-        "mode": "Guaranteed Perimetric Crop + Bilateral CLAHE Enhancement"
+        "service": "CLAWFLOW Stable Baseline Engine Active",
+        "mode": "Reliable Perimetric Crop + High-Quality Bilateral CLAHE"
     }, 200
 
-def process_document_guaranteed(image_bytes: bytes) -> Image.Image:
+def process_document_stable(image_bytes: bytes) -> Image.Image:
     try:
         print("-> [LOG 4.0] Decodificando imagen con OpenCV...")
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -31,7 +31,7 @@ def process_document_guaranteed(image_bytes: bytes) -> Image.Image:
         original_h, original_w = img.shape[:2]
         print(f"-> [LOG 4.1] Dimensiones originales: {original_w}x{original_h} px")
 
-        # Si la imagen es horizontal (fotos de la carga/remolque), se preserva a color intacta
+        # Si la imagen es horizontal (fotos de carga/remolque), se preserva a color intacta
         if original_w > original_h:
             print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color sin recortes...")
             target_w = 1600
@@ -42,16 +42,15 @@ def process_document_guaranteed(image_bytes: bytes) -> Image.Image:
             return Image.fromarray(rgb_img)
 
         # -------------------------------------------------------------
-        # RECORTE PERIMETRAL GARANTIZADO (ELIMINACIÓN DE FONDOS / MESA)
+        # RECORTE PERIMETRAL ESTABLE Y PROPORCIONAL
         # -------------------------------------------------------------
-        print("-> [LOG 4.3] Aplicando recorte perimetral simétrico garantizado para páginas verticales...")
+        print("-> [LOG 4.3] Aplicando recorte perimetral simétrico estable...")
         
-        # Margenes porcentuales precisos para eliminar el fondo de las fotos de WhatsApp en cualquier página
-        # 6% en los laterales (izq/der) y 7% en vertical (arriba/abajo)
-        crop_y_top = int(original_h * 0.07)
-        crop_y_bottom = int(original_h * 0.93)
-        crop_x_left = int(original_w * 0.06)
-        crop_x_right = int(original_w * 0.94)
+        # Márgenes limpios y equilibrados probados en las páginas exitosas (5% en horizontal, 6% en vertical)
+        crop_y_top = int(original_h * 0.06)
+        crop_y_bottom = int(original_h * 0.94)
+        crop_x_left = int(original_w * 0.05)
+        crop_x_right = int(original_w * 0.95)
 
         cropped_doc = img[crop_y_top:crop_y_bottom, crop_x_left:crop_x_right]
         print(f"-> [LOG 4.4] Recorte aplicado: de {original_w}x{original_h} a {cropped_doc.shape[1]}x{cropped_doc.shape[0]} px")
@@ -59,7 +58,7 @@ def process_document_guaranteed(image_bytes: bytes) -> Image.Image:
         # -------------------------------------------------------------
         # ESTANDARIZACIÓN Y REALCE DE TINTA (OCR-READY)
         # -------------------------------------------------------------
-        print("-> [LOG 4.5] Aplicando redimensionamiento y realce CLAHE para máxima nitidez...")
+        print("-> [LOG 4.5] Estandarizando ancho y aplicando realce CLAHE...")
         target_width = 1600
         ch, cw = cropped_doc.shape[:2]
         if cw != target_width:
@@ -73,7 +72,7 @@ def process_document_guaranteed(image_bytes: bytes) -> Image.Image:
         # Espacio de color LAB para destacar la luminancia del texto sobre el papel
         lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         cl = clahe.apply(l)
         enhanced_color = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
 
@@ -117,7 +116,7 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                processed_page = process_document_guaranteed(image_bytes)
+                processed_page = process_document_stable(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
                 print(f"🚨 [LOG 5.5] Error en imagen {index+1}: {str(img_err)}")
@@ -147,7 +146,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente con el motor de recorte perimetral garantizado."
+            "message": "PDF generado exitosamente con el motor base estable."
         }
 
     except HTTPException as he:
