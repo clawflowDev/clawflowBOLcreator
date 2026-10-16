@@ -9,17 +9,58 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Ink Density & Margin Engine", version="21.1")
+app = FastAPI(title="CLAWFLOW Local Perspective & Warp Engine", version="22.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Ink Density Engine Active",
-        "mode": "Filter Shadows + 1cm Margin Ink Detection + A4 Canvas Composition"
-    }
+        "service": "CLAWFLOW Local Perspective Warp Engine Active",
+        "mode": "Document Corner Detection + Perspective Correction + A4 Canvas"
+    }, 200
 
-def process_image_by_ink_density(image_bytes: bytes) -> Image.Image:
+def order_points(pts):
+    """Ordena 4 puntos en formato: [esquina_superior_izq, superior_der, inferior_der, inferior_izq]"""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def four_point_transform(image, pts):
+    """Aplica una transformación de perspectiva (Warp) para enderezar el documento como si hubiera sido escaneado"""
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    # Calcular el ancho de la nueva imagen
+    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    maxWidth = max(int(widthA), int(widthB))
+
+    # Calcular el alto de la nueva imagen
+    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    maxHeight = max(int(heightA), int(heightB))
+
+    # Dimensiones de destino para una proporción limpia
+    maxWidth = max(maxWidth, 800)
+    maxHeight = max(maxHeight, 1100)
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    return warped
+
+def process_document_with_warp(image_bytes: bytes) -> Image.Image:
     try:
         print("-> [LOG 4.0] Decodificando imagen con OpenCV...")
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -31,9 +72,9 @@ def process_image_by_ink_density(image_bytes: bytes) -> Image.Image:
         original_h, original_w = img.shape[:2]
         print(f"-> [LOG 4.1] Dimensiones originales: {original_w}x{original_h} px")
 
-        # Si la imagen es horizontal (fotos de la carga/remolque), la dejamos intacta a color
+        # Si la imagen es horizontal (fotos de carga), la preservamos a color sin transformaciones
         if original_w > original_h:
-            print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color sin recortes...")
+            print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color...")
             target_w = 1600
             if original_w > target_w:
                 ratio = target_w / float(original_w)
@@ -42,83 +83,49 @@ def process_image_by_ink_density(image_bytes: bytes) -> Image.Image:
             return Image.fromarray(rgb_img)
 
         # -------------------------------------------------------------
-        # FILTRADO DE SOMBRAS Y DETECCIÓN DE TINTA EFECTIVA
+        # DETECCIÓN DE CONTORNO DE 4 ESQUINAS (DOCUMENT CORNER DETECTION)
         # -------------------------------------------------------------
-        print("-> [LOG 4.3] Filtrando ruido/sombras y analizando límites reales de tinta...")
+        print("-> [LOG 4.3] Buscando esquinas y contorno del documento de papel...")
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Detección de bordes Canny optimizada para documentos
+        edged = cv2.Canny(blurred, 75, 200)
 
-        # 1. Suavizado para reducir el ruido de la cámara
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        # Encontrar contornos externos
+        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
 
-        # 2. Binarización adaptativa para aislar texto local e ignorar sombras de fondo
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY_INV, 21, 10
-        )
-
-        # 3. Limpieza morfológica: conectar letras/tablas y eliminar puntos aislados del fondo
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        cleaned_thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-        # 4. Obtener contornos de los bloques de tinta
-        contours, _ = cv2.findContours(cleaned_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_x, min_y = original_w, original_h
-        max_x, max_y = 0, 0
-        valid_ink_found = False
-
-        # Descartamos ruido pequeño (manchas, sombras lejanas) midiendo áreas de los contornos
-        min_contour_area = (original_w * original_h) * 0.0005  # Al menos 0.05% del área total
-
+        screenCnt = None
         for c in contours:
-            if cv2.contourArea(c) > min_contour_area:
-                x, y, w, h = cv2.boundingRect(c)
-                # Ignorar si el contorno es sospechosamente una línea gigante en todo el borde de la foto
-                if w > original_w * 0.98 and h > original_h * 0.98:
-                    continue
-                
-                min_x = min(min_x, x)
-                min_y = min(min_y, y)
-                max_x = max(max_x, x + w)
-                max_y = max(max_y, y + h)
-                valid_ink_found = True
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            
+            # Si el contorno tiene 4 puntos y ocupa un área considerable (>25% de la foto)
+            if len(approx) == 4 and cv2.contourArea(c) > (original_h * original_w * 0.25):
+                screenCnt = approx
+                break
 
-        if valid_ink_found and (max_x > min_x) and (max_y > min_y):
-            ink_w = max_x - min_x
-            ink_h = max_y - min_y
-            print(f"-> [LOG 4.4] Área de tinta consolidada: x={min_x}, y={min_y}, w={ink_w}, h={ink_h}")
-
-            # ---------------------------------------------------------
-            # CÁLCULO DINÁMICO DE 1 CM DE MARGEN (PADDING)
-            # ---------------------------------------------------------
-            px_per_cm = int(original_h / 29.7)  # Basado en A4 (~29.7 cm)
-            if px_per_cm < 25:
-                px_per_cm = 35
-
-            print(f"-> [LOG 4.5] Aplicando padding de 1 cm ({px_per_cm} px)...")
-
-            x1 = max(0, min_x - px_per_cm)
-            y1 = max(0, min_y - px_per_cm)
-            x2 = min(original_w, max_x + px_per_cm)
-            y2 = min(original_h, max_y + px_per_cm)
-
-            cropped_doc = img[y1:y2, x1:x2]
-            print(f"-> [LOG 4.6] Recorte efectivo realizado: de ({original_w}x{original_h}) a ({x2-x1}x{y2-y1}) px.")
+        if screenCnt is not None:
+            print("-> [LOG 4.4] ¡Contorno de 4 esquinas del papel detectado con éxito!")
+            # Aplicar la transformación de perspectiva (Enderezar y recortar limpiamente)
+            warped = four_point_transform(img, screenCnt.reshape(4, 2))
         else:
-            print("-> [LOG 4.4 WARNING] No se aislaron bloques de tinta limpios. Usando imagen con margen de resguardo.")
-            margin_y = int(original_h * 0.02)
-            margin_x = int(original_w * 0.02)
-            cropped_doc = img[margin_y:original_h-margin_y, margin_x:original_w-margin_x]
+            print("-> [LOG 4.4 WARNING] No se cerró el cuadrilátero exacto. Aplicando respaldo de encuadre seguro.")
+            margin_y = int(original_h * 0.03)
+            margin_x = int(original_w * 0.03)
+            warped = img[margin_y:original_h-margin_y, margin_x:original_w-margin_x]
 
-        # Redimensionar estándar y CLAHE
+        # Estandarizar ancho a 1600px para máxima nitidez
         target_width = 1600
-        ch, cw = cropped_doc.shape[:2]
+        ch, cw = warped.shape[:2]
         if cw > target_width:
             ratio = target_width / float(cw)
             new_h = int(ch * ratio)
-            cropped_doc = cv2.resize(cropped_doc, (target_width, new_h), interpolation=cv2.INTER_AREA)
+            warped = cv2.resize(warped, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        lab = cv2.cvtColor(cropped_doc, cv2.COLOR_BGR2LAB)
+        # Realce de contraste CLAHE (para que la tinta resalte impecable)
+        lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         cl = clahe.apply(l)
@@ -127,16 +134,16 @@ def process_image_by_ink_density(image_bytes: bytes) -> Image.Image:
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        # Lienzo blanco corporativo
+        # Lienzo blanco corporativo con margen estético de resguardo
         dw, dh = doc_pil.size
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
 
-        print("-> [LOG 4.7] Documento procesado y enmarcado con éxito.")
+        print("-> [LOG 4.5] Documento enderezado, realzado y enmarcado con éxito.")
         return canvas
 
     except Exception as e:
-        print(f"🚨 [LOG 4.8 ERROR EN PROCESAMIENTO LOCAL]: {str(e)}")
+        print(f"🚨 [LOG 4.6 ERROR EN WARP LOCAL]: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -150,10 +157,9 @@ async def process_bol(payload: BOLRequest):
     try:
         print(f"-> [LOG 5.0] Petición /process-bol recibida con {len(payload.image_urls)} imágenes.")
         if not payload.image_urls:
-            raise HTTPException(status_code=400, detail="No se recibieron URLs de imágenes.")
+            raise HTTPException(status_code=400, detail="No se recibieron imágenes.")
 
         pil_images = []
-        
         for index, img_uri in enumerate(payload.image_urls):
             try:
                 print(f"-> [LOG 5.1] Procesando imagen {index+1} de {len(payload.image_urls)}...")
@@ -165,16 +171,15 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                processed_page = process_image_by_ink_density(image_bytes)
+                processed_page = process_document_with_warp(image_bytes)
                 pil_images.append(processed_page)
-                
             except Exception as img_err:
-                print(f"🚨 [LOG 5.5] Error procesando imagen {index+1}: {str(img_err)}")
+                print(f"🚨 [LOG 5.5] Error en imagen {index+1}: {str(img_err)}")
 
         if not pil_images:
             raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada.")
 
-        print("-> [LOG 6.0] Compilando PDF final unificado en alta resolución...")
+        print("-> [LOG 6.0] Compilando PDF final unificado...")
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -191,12 +196,12 @@ async def process_bol(payload: BOLRequest):
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 6.1] ¡PDF unificado generado exitosamente sin pérdidas de contenido!")
+        print("-> [LOG 6.1] ¡PDF con perspectiva corregida generado exitosamente!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado con éxito usando detección de tinta y padding de 1cm."
+            "message": "PDF generado exitosamente con transformación de perspectiva local."
         }
 
     except HTTPException as he:
