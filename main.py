@@ -9,18 +9,18 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Autonomous Local Geometric Engine", version="33.0")
+app = FastAPI(title="CLAWFLOW Dynamic Geometric Engine", version="35.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Autonomous Geometric Engine Active",
-        "mode": "Local Contour Intelligence + Perspective Warp + CLAHE"
+        "service": "CLAWFLOW Multi-Level Dynamic Engine Active",
+        "mode": "Otsu + Convex Hull + MinAreaRect Fallback"
     }, 200
 
-def order_points(pts):
-    """Ordena dinámicamente 4 puntos: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Ordena 4 puntos en formato: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -31,8 +31,8 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-def four_point_transform(image, pts):
-    """Ejecuta el recorte de perspectiva milimétrico basado en coordenadas geométricas"""
+def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Transformación de perspectiva matemática basada en los 4 puntos detectados"""
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
 
@@ -44,8 +44,8 @@ def four_point_transform(image, pts):
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
 
-    maxWidth = max(maxWidth, 1000)
-    maxHeight = max(maxHeight, 1400)
+    maxWidth = max(maxWidth, 900)
+    maxHeight = max(maxHeight, 1200)
 
     dst = np.array([
         [0, 0],
@@ -57,66 +57,81 @@ def four_point_transform(image, pts):
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def get_autonomous_document_corners(img: np.ndarray) -> np.ndarray:
+def find_corners_multilevel(img: np.ndarray) -> np.ndarray:
     """
-    Motor local autónomo: Detecta las 4 esquinas reales del documento analizando 
-    la geometría y los contornos de la imagen de forma inteligente y robusta.
+    Estrategia Multinivel de Visión Computacional:
+    Nivel 1: Otsu + Canny + Polígono de 4 lados (Ideal págs. 1 y 2).
+    Nivel 2: Cierre Morfológico + Convex Hull (Ideal pág. 3 / recibos arrugados).
+    Nivel 3: Caja Orientada de Menor Área (MinAreaRect - Respaldo dinámico infalible).
     """
-    original_h, original_w = img.shape[:2]
-    
-    try:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Filtro bilateral para suavizar ruidos sin perder definición de bordes
-        filtered = cv2.bilateralFilter(gray, 11, 75, 75)
-        
-        # Detección de bordes adaptativa optimizada para documentos de transporte (BOL/Recibos)
-        edged = cv2.Canny(filtered, 50, 150)
-        
-        # Operación morfológica para cerrar pequeñas brechas en los bordes del papel
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+    h, w = img.shape[:2]
+    total_area = h * w
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
 
-        contours, _ = cv2.findContours(closed.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+    # -------------------------------------------------------------
+    # NIVEL 1: Canny con Umbralización Adaptativa Otsu
+    # -------------------------------------------------------------
+    high_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    low_thresh = high_thresh * 0.5
+    edged = cv2.Canny(blurred, low_thresh, high_thresh)
 
-        screenCnt = None
-        for c in contours:
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > (total_area * 0.20):
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            area = cv2.contourArea(c)
-            
-            # Validar que el contorno sea un cuadrilátero válido que ocupe entre el 15% y el 98% de la foto
-            if len(approx) == 4 and (original_h * original_w * 0.15) < area < (original_h * original_w * 0.98):
-                if cv2.isContourConvex(approx):
-                    screenCnt = approx
-                    break
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                print("-> [VISION LOG] Nivel 1 Exitoso: Cuadrilátero convexo directo detectado.")
+                return approx.reshape(4, 2).astype("float32")
 
-        if screenCnt is not None:
-            print("-> [LOG AUTO] ¡Cuadrilátero del documento detectado localmente con éxito!")
-            return screenCnt.reshape(4, 2).astype("float32")
-        
-        raise ValueError("Contorno geométrico estricto no cerrado. Activando calibrador de respaldo.")
+    # -------------------------------------------------------------
+    # NIVEL 2: Cierre Morfológico + Envolvente Convexa (Convex Hull)
+    # -------------------------------------------------------------
+    print("-> [VISION LOG] Ejecutando Nivel 2: Cierre morfológico y Convex Hull para bordes difíciles...")
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+    
+    contours_m, _ = cv2.findContours(closed.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_m = sorted(contours_m, key=cv2.contourArea, reverse=True)[:10]
 
-    except Exception as err:
-        print(f"-> [LOG AUTO FALLBACK] {str(err)} - Aplicando márgenes calibrados de precisión.")
-        
-        # Márgenes milimétricos calibrados de respaldo seguro
-        margin_x = int(original_w * 0.035)
-        margin_y = int(original_h * 0.035)
-        
-        calibrated_pts = np.array([
-            [margin_x, margin_y],                        # Top-Left
-            [original_w - margin_x, margin_y],           # Top-Right
-            [original_w - margin_x, original_h - margin_y],# Bottom-Right
-            [margin_x, original_h - margin_y]            # Bottom-Left
-        ], dtype="float32")
-        
-        return calibrated_pts
+    for c in contours_m:
+        area = cv2.contourArea(c)
+        if area > (total_area * 0.18):
+            hull = cv2.convexHull(c)
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, 0.025 * peri, True)
+            if len(approx) == 4:
+                print("-> [VISION LOG] Nivel 2 Exitoso: Envolvente convexa ajustada a 4 esquinas.")
+                return approx.reshape(4, 2).astype("float32")
+
+    # -------------------------------------------------------------
+    # NIVEL 3: Caja Orientada de Menor Área (MinAreaRect)
+    # -------------------------------------------------------------
+    print("-> [VISION LOG] Ejecutando Nivel 3: Caja delimitadora orientada de precisión...")
+    for c in contours_m:
+        area = cv2.contourArea(c)
+        if area > (total_area * 0.15):
+            rect = cv2.minAreaRect(c)
+            box = cv2.boxPoints(rect)
+            print("-> [VISION LOG] Nivel 3 Exitoso: Esquinas calculadas vía MinAreaRect.")
+            return box.astype("float32")
+
+    # Respaldo Geométrico Proporcional Limpio (Si la foto carece por completo de contraste)
+    print("-> [VISION LOG WARNING] Sin contraste suficiente. Aplicando margen de seguridad del 2.5%.")
+    mx, my = int(w * 0.025), int(h * 0.025)
+    return np.array([
+        [mx, my],
+        [w - mx, my],
+        [w - mx, h - my],
+        [mx, h - my]
+    ], dtype="float32")
 
 def process_document_pipeline(image_bytes: bytes) -> Image.Image:
     try:
-        print("-> [LOG 4.0] Decodificando imagen con OpenCV...")
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
@@ -124,11 +139,10 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
             raise ValueError("No se pudo decodificar la imagen binaria.")
 
         original_h, original_w = img.shape[:2]
-        print(f"-> [LOG 4.1] Dimensiones originales: {original_w}x{original_h} px")
 
-        # Validación para imágenes horizontales (fotos de carga/remolque) -> Se preservan intactas a color
+        # Tratamiento de imágenes horizontales (fotos de remolques/carga)
         if original_w > original_h:
-            print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color sin recortes...")
+            print("-> [LOG] Imagen horizontal. Preservando relación de aspecto...")
             target_w = 1600
             if original_w > target_w:
                 ratio = target_w / float(original_w)
@@ -136,50 +150,40 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return Image.fromarray(rgb_img)
 
-        # -------------------------------------------------------------
-        # FASE 1: OBTENCIÓN AUTÓNOMA DE COORDENADAS
-        # -------------------------------------------------------------
-        print("-> [LOG 4.3] Analizando y extrayendo esquinas del documento autónomamente...")
-        corner_points = get_autonomous_document_corners(img)
+        # 1. Extracción de las 4 esquinas mediante el motor multinivel
+        corner_points = find_corners_multilevel(img)
 
-        # -------------------------------------------------------------
-        # FASE 2: EJECUCIÓN DE PERSPECTIVA MILIMÉTRICA
-        # -------------------------------------------------------------
-        print("-> [LOG 4.4] Ejecutando transformación geométrica de perspectiva...")
-        warped_doc = four_point_transform(img, corner_points)
+        # 2. Transformación de perspectiva
+        warped = four_point_transform(img, corner_points)
 
-        # -------------------------------------------------------------
-        # FASE 3: ESTANDARIZACIÓN Y REALCE DE TINTA (OCR-READY CORPORATIVO)
-        # -------------------------------------------------------------
-        print("-> [LOG 4.5] Estandarizando y aplicando motor CLAHE de alta legibilidad...")
+        # 3. Estandarización de tamaño (Ancho fijo de 1600px para legibilidad uniforme)
         target_width = 1600
-        ch, cw = warped_doc.shape[:2]
+        ch, cw = warped.shape[:2]
         if cw != target_width:
             ratio = target_width / float(cw)
             new_h = int(ch * ratio)
-            warped_doc = cv2.resize(warped_doc, (target_width, new_h), interpolation=cv2.INTER_AREA)
+            warped = cv2.resize(warped, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        # Filtro bilateral para limpieza de fondo y realce de luminancia LAB + CLAHE
-        smoothed = cv2.bilateralFilter(warped_doc, 9, 75, 75)
+        # 4. Filtro bilateral anti-ruido + Realce de legibilidad de tinta (CLAHE)
+        smoothed = cv2.bilateralFilter(warped, 9, 75, 75)
         lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         cl = clahe.apply(l)
         enhanced_color = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
 
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        # Lienzo blanco corporativo unificado con margen estético de 30px
+        # 5. Enmarcado en Lienzo Blanco Corporativo A4 (30px de margen estético)
         dw, dh = doc_pil.size
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
 
-        print("-> [LOG 4.6] Página procesada, recortada con precisión y enmarcada impecablemente.")
         return canvas
 
     except Exception as e:
-        print(f"🚨 [LOG 4.7 ERROR EN PIPELINE AUTÓNOMO]: {str(e)}")
+        print(f"🚨 [LOG ERROR]: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -191,14 +195,13 @@ class BOLRequest(BaseModel):
 @app.post("/process-bol")
 async def process_bol(payload: BOLRequest):
     try:
-        print(f"-> [LOG 5.0] Petición /process-bol recibida con {len(payload.image_urls)} imágenes.")
+        print(f"-> [LOG] Procesando lote de {len(payload.image_urls)} imágenes...")
         if not payload.image_urls:
-            raise HTTPException(status_code=400, detail="No se recibieron imágenes en el payload.")
+            raise HTTPException(status_code=400, detail="No se recibieron imágenes.")
 
         pil_images = []
         for index, img_uri in enumerate(payload.image_urls):
             try:
-                print(f"-> [LOG 5.1] Procesando imagen {index+1} de {len(payload.image_urls)}...")
                 if img_uri.startswith("data:"):
                     header, encoded = img_uri.split(",", 1)
                     image_bytes = base64.b64decode(encoded)
@@ -210,12 +213,11 @@ async def process_bol(payload: BOLRequest):
                 processed_page = process_document_pipeline(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
-                print(f"🚨 [LOG 5.5] Error aislado en imagen {index+1}: {str(img_err)}")
+                print(f"🚨 [LOG ERROR] Imagen {index+1}: {str(img_err)}")
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="Ninguna imagen pudo ser procesada en el lote.")
+            raise HTTPException(status_code=400, detail="Error en procesamiento del lote.")
 
-        print("-> [LOG 6.0] Compilando PDF final unificado en alta resolución...")
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -232,16 +234,14 @@ async def process_bol(payload: BOLRequest):
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 6.1] ¡PDF unificado generado exitosamente con motor autónomo local!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente con motor geométrico autónomo local."
+            "message": "PDF procesado exitosamente mediante motor multinivel OpenCV."
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"🚨 [LOG 6.2 ERROR CRÍTICO EN ENDPOINT]: {str(e)}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": str(e)}))
