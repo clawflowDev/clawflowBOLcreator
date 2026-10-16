@@ -9,18 +9,18 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Dynamic Geometric Engine", version="35.0")
+app = FastAPI(title="CLAWFLOW Sheet Isolation Engine", version="36.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Multi-Level Dynamic Engine Active",
-        "mode": "Otsu + Convex Hull + MinAreaRect Fallback"
+        "service": "CLAWFLOW Sheet Isolation Engine Active",
+        "mode": "White Sheet Isolation + Outer Boundary Perspective Warp"
     }, 200
 
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """Ordena 4 puntos en formato: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
+    """Ordena 4 puntos: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -32,7 +32,7 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Transformación de perspectiva matemática basada en los 4 puntos detectados"""
+    """Transformación de perspectiva basada en la masa real de la hoja"""
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
 
@@ -44,8 +44,8 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
 
-    maxWidth = max(maxWidth, 900)
-    maxHeight = max(maxHeight, 1200)
+    maxWidth = max(maxWidth, 1000)
+    maxHeight = max(maxHeight, 1400)
 
     dst = np.array([
         [0, 0],
@@ -57,72 +57,55 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def find_corners_multilevel(img: np.ndarray) -> np.ndarray:
+def get_paper_sheet_corners(img: np.ndarray) -> np.ndarray:
     """
-    Estrategia Multinivel de Visión Computacional:
-    Nivel 1: Otsu + Canny + Polígono de 4 lados (Ideal págs. 1 y 2).
-    Nivel 2: Cierre Morfológico + Convex Hull (Ideal pág. 3 / recibos arrugados).
-    Nivel 3: Caja Orientada de Menor Área (MinAreaRect - Respaldo dinámico infalible).
+    Aísla la MASA BLANCA completa de la hoja de papel (evita engancharse con tablas internas).
     """
     h, w = img.shape[:2]
     total_area = h * w
+    
+    # 1. Escala de grises + Blur para uniformar la luz del papel
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
 
-    # -------------------------------------------------------------
-    # NIVEL 1: Canny con Umbralización Adaptativa Otsu
-    # -------------------------------------------------------------
-    high_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    low_thresh = high_thresh * 0.5
-    edged = cv2.Canny(blurred, low_thresh, high_thresh)
+    # 2. Umbralizado de Otsu para separar Fondo vs Papel (Masa Clara)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+    # Si la imagen tiene el fondo predominantemente oscuro y la hoja clara
+    if np.mean(thresh) < 127:
+        thresh = cv2.bitwise_not(thresh)
+
+    # 3. Limpieza morfológica para fusionar todo el texto/tablas en un solo bloque blanco solido
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    # 4. Encontrar el contorno EXTERNO más grande (la hoja entera)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     for c in contours:
         area = cv2.contourArea(c)
-        if area > (total_area * 0.20):
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                print("-> [VISION LOG] Nivel 1 Exitoso: Cuadrilátero convexo directo detectado.")
-                return approx.reshape(4, 2).astype("float32")
-
-    # -------------------------------------------------------------
-    # NIVEL 2: Cierre Morfológico + Envolvente Convexa (Convex Hull)
-    # -------------------------------------------------------------
-    print("-> [VISION LOG] Ejecutando Nivel 2: Cierre morfológico y Convex Hull para bordes difíciles...")
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
-    
-    contours_m, _ = cv2.findContours(closed.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours_m = sorted(contours_m, key=cv2.contourArea, reverse=True)[:10]
-
-    for c in contours_m:
-        area = cv2.contourArea(c)
-        if area > (total_area * 0.18):
+        if area > (total_area * 0.25):
+            # Envolvente convexa para tapar hendiduras o firmas que sobresalgan
             hull = cv2.convexHull(c)
+            
+            # Aproximar a un polígono de 4 esquinas
             peri = cv2.arcLength(hull, True)
-            approx = cv2.approxPolyDP(hull, 0.025 * peri, True)
-            if len(approx) == 4:
-                print("-> [VISION LOG] Nivel 2 Exitoso: Envolvente convexa ajustada a 4 esquinas.")
-                return approx.reshape(4, 2).astype("float32")
+            approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
 
-    # -------------------------------------------------------------
-    # NIVEL 3: Caja Orientada de Menor Área (MinAreaRect)
-    # -------------------------------------------------------------
-    print("-> [VISION LOG] Ejecutando Nivel 3: Caja delimitadora orientada de precisión...")
-    for c in contours_m:
-        area = cv2.contourArea(c)
-        if area > (total_area * 0.15):
-            rect = cv2.minAreaRect(c)
+            if len(approx) == 4:
+                print("-> [ISOLATION LOG] Hoja completa aislada con 4 esquinas externas.")
+                return approx.reshape(4, 2).astype("float32")
+            
+            # Si tiene más de 4 esquinas por arrugas, extraemos el Bounding Box Rotado
+            rect = cv2.minAreaRect(hull)
             box = cv2.boxPoints(rect)
-            print("-> [VISION LOG] Nivel 3 Exitoso: Esquinas calculadas vía MinAreaRect.")
+            print("-> [ISOLATION LOG] Hoja aislada mediante rectángulo envolvente mínimo.")
             return box.astype("float32")
 
-    # Respaldo Geométrico Proporcional Limpio (Si la foto carece por completo de contraste)
-    print("-> [VISION LOG WARNING] Sin contraste suficiente. Aplicando margen de seguridad del 2.5%.")
-    mx, my = int(w * 0.025), int(h * 0.025)
+    # Resguardo calibrado si no hay contraste con el fondo
+    print("-> [ISOLATION WARNING] Sin contraste exterior. Aplicando resguardo perimetral del 3%.")
+    mx, my = int(w * 0.03), int(h * 0.03)
     return np.array([
         [mx, my],
         [w - mx, my],
@@ -136,13 +119,13 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            raise ValueError("No se pudo decodificar la imagen binaria.")
+            raise ValueError("No se pudo decodificar la imagen.")
 
         original_h, original_w = img.shape[:2]
 
-        # Tratamiento de imágenes horizontales (fotos de remolques/carga)
+        # Mantenemos intactas las fotos horizontales (cargas/remolques)
         if original_w > original_h:
-            print("-> [LOG] Imagen horizontal. Preservando relación de aspecto...")
+            print("-> [LOG] Imagen horizontal. Preservando a color...")
             target_w = 1600
             if original_w > target_w:
                 ratio = target_w / float(original_w)
@@ -150,13 +133,13 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return Image.fromarray(rgb_img)
 
-        # 1. Extracción de las 4 esquinas mediante el motor multinivel
-        corner_points = find_corners_multilevel(img)
+        # 1. Obtener esquinas de la MASA COMPLETA DEL PAPEL
+        corner_points = get_paper_sheet_corners(img)
 
         # 2. Transformación de perspectiva
         warped = four_point_transform(img, corner_points)
 
-        # 3. Estandarización de tamaño (Ancho fijo de 1600px para legibilidad uniforme)
+        # 3. Estandarización de tamaño
         target_width = 1600
         ch, cw = warped.shape[:2]
         if cw != target_width:
@@ -164,7 +147,7 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
             new_h = int(ch * ratio)
             warped = cv2.resize(warped, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        # 4. Filtro bilateral anti-ruido + Realce de legibilidad de tinta (CLAHE)
+        # 4. Realce de legibilidad CLAHE
         smoothed = cv2.bilateralFilter(warped, 9, 75, 75)
         lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
@@ -175,7 +158,7 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         doc_rgb = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(doc_rgb)
 
-        # 5. Enmarcado en Lienzo Blanco Corporativo A4 (30px de margen estético)
+        # 5. Enmarcado A4
         dw, dh = doc_pil.size
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
@@ -195,9 +178,8 @@ class BOLRequest(BaseModel):
 @app.post("/process-bol")
 async def process_bol(payload: BOLRequest):
     try:
-        print(f"-> [LOG] Procesando lote de {len(payload.image_urls)} imágenes...")
         if not payload.image_urls:
-            raise HTTPException(status_code=400, detail="No se recibieron imágenes.")
+            raise HTTPException(status_code=400, detail="Sin imágenes en payload.")
 
         pil_images = []
         for index, img_uri in enumerate(payload.image_urls):
@@ -213,10 +195,10 @@ async def process_bol(payload: BOLRequest):
                 processed_page = process_document_pipeline(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
-                print(f"🚨 [LOG ERROR] Imagen {index+1}: {str(img_err)}")
+                print(f"🚨 [ERROR IMG {index+1}]: {str(img_err)}")
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="Error en procesamiento del lote.")
+            raise HTTPException(status_code=400, detail="Sin páginas procesadas.")
 
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
@@ -238,7 +220,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF procesado exitosamente mediante motor multinivel OpenCV."
+            "message": "PDF procesado con aislamiento de masa de hoja completa."
         }
 
     except HTTPException as he:
