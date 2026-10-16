@@ -9,18 +9,17 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Local Perspective & Warp Engine", version="22.0")
+app = FastAPI(title="CLAWFLOW Robust Document Warp Engine", version="23.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Local Perspective Warp Engine Active",
-        "mode": "Document Corner Detection + Perspective Correction + A4 Canvas"
+        "service": "CLAWFLOW Robust Document Warp Engine Active",
+        "mode": "Adaptive Perspective Warp + Fallback Perimetric Crop"
     }, 200
 
 def order_points(pts):
-    """Ordena 4 puntos en formato: [esquina_superior_izq, superior_der, inferior_der, inferior_izq]"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -32,21 +31,17 @@ def order_points(pts):
     return rect
 
 def four_point_transform(image, pts):
-    """Aplica una transformación de perspectiva (Warp) para enderezar el documento como si hubiera sido escaneado"""
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
 
-    # Calcular el ancho de la nueva imagen
     widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
     widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
     maxWidth = max(int(widthA), int(widthB))
 
-    # Calcular el alto de la nueva imagen
     heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
 
-    # Dimensiones de destino para una proporción limpia
     maxWidth = max(maxWidth, 800)
     maxHeight = max(maxHeight, 1100)
 
@@ -72,7 +67,7 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
         original_h, original_w = img.shape[:2]
         print(f"-> [LOG 4.1] Dimensiones originales: {original_w}x{original_h} px")
 
-        # Si la imagen es horizontal (fotos de carga), la preservamos a color sin transformaciones
+        # Si la imagen es horizontal (fotos de carga), la preservamos a color
         if original_w > original_h:
             print("-> [LOG 4.2] Imagen horizontal detectada. Preservando a color...")
             target_w = 1600
@@ -83,38 +78,37 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
             return Image.fromarray(rgb_img)
 
         # -------------------------------------------------------------
-        # DETECCIÓN DE CONTORNO DE 4 ESQUINAS (DOCUMENT CORNER DETECTION)
+        # DETECCIÓN ADAPTATIVA (WARP + RECÓRTE PERIMETRAL SEGURO)
         # -------------------------------------------------------------
-        print("-> [LOG 4.3] Buscando esquinas y contorno del documento de papel...")
+        print("-> [LOG 4.3] Buscando esquinas y contorno del documento...")
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # Detección de bordes Canny optimizada para documentos
-        edged = cv2.Canny(blurred, 75, 200)
+        edged = cv2.Canny(blurred, 50, 150)
 
-        # Encontrar contornos externos
         contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
 
         screenCnt = None
         for c in contours:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
             
-            # Si el contorno tiene 4 puntos y ocupa un área considerable (>25% de la foto)
-            if len(approx) == 4 and cv2.contourArea(c) > (original_h * original_w * 0.25):
+            area = cv2.contourArea(c)
+            # Aceptar contornos de 4 esquinas que ocupen entre el 20% y el 95% de la foto
+            if len(approx) == 4 and (original_h * original_w * 0.20) < area < (original_h * original_w * 0.95):
                 screenCnt = approx
                 break
 
         if screenCnt is not None:
-            print("-> [LOG 4.4] ¡Contorno de 4 esquinas del papel detectado con éxito!")
-            # Aplicar la transformación de perspectiva (Enderezar y recortar limpiamente)
+            print("-> [LOG 4.4] ¡Contorno de 4 esquinas detectado con éxito! Aplicando Warp...")
             warped = four_point_transform(img, screenCnt.reshape(4, 2))
         else:
-            print("-> [LOG 4.4 WARNING] No se cerró el cuadrilátero exacto. Aplicando respaldo de encuadre seguro.")
-            margin_y = int(original_h * 0.03)
-            margin_x = int(original_w * 0.03)
-            warped = img[margin_y:original_h-margin_y, margin_x:original_w-margin_x]
+            print("-> [LOG 4.4 WARNING] Contorno no cerrado. Aplicando recorte perimetral inteligente del 5% para eliminar fondo.")
+            # Recorte de seguridad del 5% en cada lado para garantizar que la página 3 elimine el fondo oscuro o mesa
+            crop_y = int(original_h * 0.05)
+            crop_x = int(original_w * 0.05)
+            warped = img[crop_y:original_h-crop_y, crop_x:original_w-crop_x]
 
         # Estandarizar ancho a 1600px para máxima nitidez
         target_width = 1600
@@ -124,7 +118,7 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
             new_h = int(ch * ratio)
             warped = cv2.resize(warped, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
-        # Realce de contraste CLAHE (para que la tinta resalte impecable)
+        # Realce de contraste CLAHE
         lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -139,11 +133,11 @@ def process_document_with_warp(image_bytes: bytes) -> Image.Image:
         canvas = Image.new("RGB", (dw + 60, dh + 60), (255, 255, 255))
         canvas.paste(doc_pil, (30, 30))
 
-        print("-> [LOG 4.5] Documento enderezado, realzado y enmarcado con éxito.")
+        print("-> [LOG 4.5] Documento procesado, recortado y enmarcado con éxito.")
         return canvas
 
     except Exception as e:
-        print(f"🚨 [LOG 4.6 ERROR EN WARP LOCAL]: {str(e)}")
+        print(f"🚨 [LOG 4.6 ERROR EN PROCESAMIENTO]: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -196,12 +190,12 @@ async def process_bol(payload: BOLRequest):
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 6.1] ¡PDF con perspectiva corregida generado exitosamente!")
+        print("-> [LOG 6.1] ¡PDF generado exitosamente!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente con transformación de perspectiva local."
+            "message": "PDF generado exitosamente con respaldo de recorte perimetral adaptativo."
         }
 
     except HTTPException as he:
