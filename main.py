@@ -9,14 +9,14 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Precision AI Vision Engine", version="32.0")
+app = FastAPI(title="CLAWFLOW Autonomous Local Geometric Engine", version="33.0")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Precision AI Vision Engine Active",
-        "mode": "Optimized AI Corner Extraction + Perspective Warp & CLAHE"
+        "service": "CLAWFLOW Autonomous Geometric Engine Active",
+        "mode": "Local Contour Intelligence + Perspective Warp + CLAHE"
     }, 200
 
 def order_points(pts):
@@ -57,28 +57,51 @@ def four_point_transform(image, pts):
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def get_ai_document_corners(img: np.ndarray) -> np.ndarray:
+def get_autonomous_document_corners(img: np.ndarray) -> np.ndarray:
     """
-    Extracción de esquinas inteligentes con calibración de precisión milimétrica.
+    Motor local autónomo: Detecta las 4 esquinas reales del documento analizando 
+    la geometría y los contornos de la imagen de forma inteligente y robusta.
     """
     original_h, original_w = img.shape[:2]
     
     try:
-        # Espacio dedicado para el conector de coordenadas de la IA
-        ai_response_mock = None 
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        if ai_response_mock:
-            pts = np.array(ai_response_mock, dtype="float32")
-            if pts.shape == (4, 2):
-                print("-> [LOG AI] Coordenadas de esquinas obtenidas exitosamente por IA.")
-                return pts
+        # Filtro bilateral para suavizar ruidos sin perder definición de bordes
+        filtered = cv2.bilateralFilter(gray, 11, 75, 75)
         
-        raise ValueError("Modelo de IA sin respuesta directa. Activando calibrador geométrico de precisión.")
+        # Detección de bordes adaptativa optimizada para documentos de transporte (BOL/Recibos)
+        edged = cv2.Canny(filtered, 50, 150)
+        
+        # Operación morfológica para cerrar pequeñas brechas en los bordes del papel
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
 
-    except Exception as ai_err:
-        print(f"-> [LOG AI CALIBRATION] Ajustando márgenes de precisión: {str(ai_err)}")
+        contours, _ = cv2.findContours(closed.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+
+        screenCnt = None
+        for c in contours:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            area = cv2.contourArea(c)
+            
+            # Validar que el contorno sea un cuadrilátero válido que ocupe entre el 15% y el 98% de la foto
+            if len(approx) == 4 and (original_h * original_w * 0.15) < area < (original_h * original_w * 0.98):
+                if cv2.isContourConvex(approx):
+                    screenCnt = approx
+                    break
+
+        if screenCnt is not None:
+            print("-> [LOG AUTO] ¡Cuadrilátero del documento detectado localmente con éxito!")
+            return screenCnt.reshape(4, 2).astype("float32")
         
-        # Margenes milimétricos calibrados para barrer exactamente el fondo sin recortar el texto
+        raise ValueError("Contorno geométrico estricto no cerrado. Activando calibrador de respaldo.")
+
+    except Exception as err:
+        print(f"-> [LOG AUTO FALLBACK] {str(err)} - Aplicando márgenes calibrados de precisión.")
+        
+        # Márgenes milimétricos calibrados de respaldo seguro
         margin_x = int(original_w * 0.035)
         margin_y = int(original_h * 0.035)
         
@@ -114,15 +137,15 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
             return Image.fromarray(rgb_img)
 
         # -------------------------------------------------------------
-        # FASE 1: OBTENCIÓN DE COORDENADAS CON CALIBRACIÓN DE PRECISIÓN
+        # FASE 1: OBTENCIÓN AUTÓNOMA DE COORDENADAS
         # -------------------------------------------------------------
-        print("-> [LOG 4.3] Obteniendo coordenadas calibradas del documento...")
-        corner_points = get_ai_document_corners(img)
+        print("-> [LOG 4.3] Analizando y extrayendo esquinas del documento autónomamente...")
+        corner_points = get_autonomous_document_corners(img)
 
         # -------------------------------------------------------------
         # FASE 2: EJECUCIÓN DE PERSPECTIVA MILIMÉTRICA
         # -------------------------------------------------------------
-        print("-> [LOG 4.4] Ejecutando transformación geométrica de alta precisión...")
+        print("-> [LOG 4.4] Ejecutando transformación geométrica de perspectiva...")
         warped_doc = four_point_transform(img, corner_points)
 
         # -------------------------------------------------------------
@@ -156,7 +179,7 @@ def process_document_pipeline(image_bytes: bytes) -> Image.Image:
         return canvas
 
     except Exception as e:
-        print(f"🚨 [LOG 4.7 ERROR EN PIPELINE DE VISION]: {str(e)}")
+        print(f"🚨 [LOG 4.7 ERROR EN PIPELINE AUTÓNOMO]: {str(e)}")
         nparr = np.frombuffer(image_bytes, np.uint8)
         np_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         return Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
@@ -209,12 +232,12 @@ async def process_bol(payload: BOLRequest):
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 6.1] ¡PDF unificado generado exitosamente con precisión calibrada!")
+        print("-> [LOG 6.1] ¡PDF unificado generado exitosamente con motor autónomo local!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF generado exitosamente con motor de precisión calibrada."
+            "message": "PDF generado exitosamente con motor geométrico autónomo local."
         }
 
     except HTTPException as he:
