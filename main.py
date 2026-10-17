@@ -10,9 +10,8 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Manual Crop Engine", version="40.0")
+app = FastAPI(title="CLAWFLOW Pro-Scan Engine", version="41.0")
 
-# Habilitar CORS para que Apps Script / WebApp pueda comunicarse sin bloqueos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,63 +24,78 @@ app.add_middleware(
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Manual Crop & A4 Formatting Engine",
-        "mode": "Manual Crop Payload + CLAHE Enhancement + Proportional A4 Canvas"
+        "service": "CLAWFLOW Strict Fill-to-Fit & High Contrast Tinta Engine",
     }, 200
 
-def process_cropped_image(image_bytes: bytes) -> Image.Image:
-    """Aplica realce de tinta y centra proporcionalmente la imagen en un lienzo A4"""
+def process_pro_document(image_bytes: bytes) -> Image.Image:
+    """
+    Aplica binarización de alto contraste para eliminar sombras y realiza 
+    un Fill-to-Fit estricto al máximo espacio de la hoja A4.
+    """
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
     if img is None:
-        raise ValueError("No se pudo decodificar la imagen recortada.")
+        raise ValueError("No se pudo decodificar la imagen.")
 
-    # 1. Filtro Bilateral: suaviza grano de papel conservando nitidez de tinta
-    smoothed = cv2.bilateralFilter(img, 9, 75, 75)
+    # Si la imagen es horizontal (ej. la foto del camión/remolque), la dejamos pasar limpia sin binarizar texto
+    if img.shape[1] > img.shape[0]:
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        doc_pil = Image.fromarray(rgb)
+    else:
+        # 1. Escala de grises
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # 2. Reducción de ruido avanzada manteniendo bordes de texto
+        denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+        
+        # 3. Umbral Adaptativo para eliminar sombras del asiento y blanquear el fondo
+        # Esto convierte las sombras oscuras a blanco y deja la tinta ultra nítida
+        thresh = cv2.adaptiveThreshold(
+            denoised, 255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 21, 10
+        )
+        
+        # Convertir a formato RGB de PIL
+        rgb = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+        doc_pil = Image.fromarray(rgb)
 
-    # 2. Realce de Iluminación Local (CLAHE)
-    lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    enhanced = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
-
-    # Convertir a PIL
-    doc_pil = Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
-
-    # 3. Montaje A4 Proporcional (1480px x 2100px)
-    target_w, target_h = 1480, 2100
+    # Dimensiones exactas proporcionales a una hoja A4 a alta resolución (300 DPI aprox: 2480 x 3508 o versión estándar 1650 x 2339)
+    target_w, target_h = 1650, 2339 
     
-    # Escalar para cubrir la mayor área posible conservando aspecto
-    doc_pil.thumbnail((target_w - 60, target_h - 60), Image.Resampling.LANCZOS)
+    # Calcular escala de "Fill-to-Fit" maximizada
+    dw, dh = doc_pil.size
+    ratio = min((target_w - 40) / dw, (target_h - 40) / dh)
+    new_w = int(dw * ratio)
+    new_h = int(dh * ratio)
     
-    # Crear lienzo A4 totalmente blanco
+    # Redimensionar con la máxima calidad de interpolación
+    doc_pil = doc_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # Crear lienzo A4 100% blanco puro
     canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
     
-    # Calcular coordenadas para centrado perfecto
-    dw, dh = doc_pil.size
-    pos_x = (target_w - dw) // 2
-    pos_y = (target_h - dh) // 2
+    # Centrar perfectamente el documento escalado
+    pos_x = (target_w - new_w) // 2
+    pos_y = (target_h - new_h) // 2
     
     canvas.paste(doc_pil, (pos_x, pos_y))
     return canvas
 
-class ManualCropRequest(BaseModel):
-    image_urls: List[str] # Lista de imágenes en Base64 o URLs recortadas
+class BOLRequest(BaseModel):
+    image_urls: List[str]
     metadata: Dict[str, Any] = {}
 
 @app.post("/process-bol")
-async def process_bol(payload: ManualCropRequest):
+async def process_bol(payload: BOLRequest):
     try:
-        print(f"-> [LOG 1.0] Petición recibida con {len(payload.image_urls)} recortes manuales.")
         if not payload.image_urls:
-            raise HTTPException(status_code=400, detail="No se recibieron imágenes en el payload.")
+            raise HTTPException(status_code=400, detail="Sin imágenes en payload.")
 
         pil_images = []
         for index, img_uri in enumerate(payload.image_urls):
             try:
-                print(f"-> [LOG 1.1] Procesando recorte de página {index+1}...")
                 if img_uri.startswith("data:"):
                     header, encoded = img_uri.split(",", 1)
                     image_bytes = base64.b64decode(encoded)
@@ -90,15 +104,14 @@ async def process_bol(payload: ManualCropRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                processed_page = process_cropped_image(image_bytes)
+                processed_page = process_pro_document(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
-                print(f"🚨 [LOG ERROR] Error en página {index+1}: {str(img_err)}")
+                print(f"🚨 [ERROR IMG {index+1}]: {str(img_err)}")
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="Ninguna imagen recortada pudo ser procesada.")
+            raise HTTPException(status_code=400, detail="Sin páginas procesadas.")
 
-        print("-> [LOG 2.0] Consolidando PDF A4 final...")
         pdf_output = io.BytesIO()
         first_image = pil_images[0]
         remaining_images = pil_images[1:] if len(pil_images) > 1 else []
@@ -108,23 +121,21 @@ async def process_bol(payload: ManualCropRequest):
             format="PDF",
             save_all=True,
             append_images=remaining_images,
-            quality=92,
+            quality=95,
             optimize=True
         )
         
         pdf_output.seek(0)
         pdf_base64 = base64.b64encode(pdf_output.read()).decode("utf-8")
 
-        print("-> [LOG 2.1] ¡PDF A4 compilado exitosamente!")
         return {
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF consolidado con recortes manuales en formato A4."
+            "message": "PDF optimizado con Fill-to-Fit y binarización de alta nitidez."
         }
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"🚨 [LOG ERROR CRÍTICO]: {str(e)}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": str(e)}))
