@@ -10,7 +10,7 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Master Scan Engine", version="50.0")
+app = FastAPI(title="CLAWFLOW Clean Readable Engine", version="51.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ app.add_middleware(
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Master Engine: Deskew + Advanced CLAHE + Unsharp Mask + Fill-to-Fit",
+        "service": "CLAWFLOW Clean Readable: Deskew + Gentle CLAHE + Fill-to-Fit",
     }, 200
 
 def deskew_image(image: np.ndarray) -> np.ndarray:
@@ -52,10 +52,10 @@ def deskew_image(image: np.ndarray) -> np.ndarray:
         
     return image
 
-def process_master_document(image_bytes: bytes) -> Image.Image:
+def process_clean_document(image_bytes: bytes) -> Image.Image:
     """
-    Procesamiento maestro: Deskew + Filtro Bilateral + CLAHE optimizado + 
-    Unsharp Mask (Enfoque de Tinta) + Fill-to-Fit estricto A4.
+    Procesamiento limpio: Deskew + Filtro Bilateral suave + CLAHE sutil 
+    (Sin sobre-enfoque para garantizar legibilidad natural) + Fill-to-Fit A4.
     """
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -63,7 +63,7 @@ def process_master_document(image_bytes: bytes) -> Image.Image:
     if img is None:
         raise ValueError("No se pudo decodificar la imagen.")
 
-    # Si es imagen horizontal (ej. fotos de carga), se procesa a color limpio sin binarizar texto
+    # Si es imagen horizontal (ej. fotos de carga), se pasa limpia a color
     if img.shape[1] > img.shape[0]:
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(rgb)
@@ -71,24 +71,20 @@ def process_master_document(image_bytes: bytes) -> Image.Image:
         # 1. Enderezar
         straight = deskew_image(img)
         
-        # 2. Escala de grises
-        gray = cv2.cvtColor(straight, cv2.COLOR_BGR2GRAY)
+        # 2. Filtro bilateral suave para eliminar ruido de papel sin alterar el trazo de la letra
+        smoothed = cv2.bilateralFilter(straight, 9, 30, 30)
 
-        # 3. Filtro bilateral para suavizar textura de arrugas del papel
-        smooth = cv2.bilateralFilter(gray, 9, 75, 75)
-
-        # 4. Ecualización local CLAHE (Aclara fondos oscuros y resalta tinta)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced_gray = clahe.apply(smooth)
-
-        # 5. Unsharp Masking (Técnica de estudio fotográfico para afilar los bordes de la letra y firmas)
-        blurred = cv2.GaussianBlur(enhanced_gray, (0, 0), 3)
-        sharpened = cv2.addWeighted(enhanced_gray, 1.4, blurred, -0.4, 0)
-
-        rgb = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
+        # 3. CLAHE muy sutil (clipLimit=1.2) solo para aclarar ligeramente fondos opacos
+        lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        
+        enhanced = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+        rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(rgb)
 
-    # 6. Fill-to-Fit Proporcional Maximizado sobre Lienzo A4
+    # 4. Fill-to-Fit Proporcional Maximizado sobre Lienzo A4
     target_w, target_h = 1650, 2339 
     dw, dh = doc_pil.size
     ratio = min((target_w - 60) / dw, (target_h - 60) / dh)
@@ -125,7 +121,7 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                processed_page = process_master_document(image_bytes)
+                processed_page = process_clean_document(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
                 print(f"🚨 [ERROR IMG {index+1}]: {str(img_err)}")
@@ -153,7 +149,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF optimizado con motor maestro de imagen y formato A4."
+            "message": "PDF optimizado con legibilidad natural y formato A4."
         }
 
     except HTTPException as he:
