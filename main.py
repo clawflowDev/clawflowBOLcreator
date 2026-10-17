@@ -10,7 +10,7 @@ import numpy as np
 import cv2
 from PIL import Image
 
-app = FastAPI(title="CLAWFLOW Pro-Scan Engine", version="41.0")
+app = FastAPI(title="CLAWFLOW Pro-Deskew Engine", version="43.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,13 +24,47 @@ app.add_middleware(
 def health_check():
     return {
         "status": "online", 
-        "service": "CLAWFLOW Strict Fill-to-Fit & High Contrast Tinta Engine",
+        "service": "CLAWFLOW Balanced + Deskew & Fill-to-Fit Engine",
     }, 200
 
-def process_pro_document(image_bytes: bytes) -> Image.Image:
+def deskew_image(image: np.ndarray) -> np.ndarray:
     """
-    Aplica binarización de alto contraste para eliminar sombras y realiza 
-    un Fill-to-Fit estricto al máximo espacio de la hoja A4.
+    Detecta el ángulo de inclinación del documento recortado y lo endereza
+    para que quede perfectamente vertical.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Invertir para que el fondo blanco sea negro y el texto/bordes blancos
+    gray = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    
+    # Encontrar coordenadas de los píxeles no cero (el documento)
+    coords = np.column_stack(np.where(thresh > 0))
+    if len(coords) < 10:
+        return image # Si no hay suficientes puntos, retorna original
+        
+    angle = cv2.minAreaRect(coords)[-1]
+    
+    # Ajustar el ángulo de rotación estándar de OpenCV
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+        
+    # Solo enderezar si la inclinación es perceptible (> 0.5 grados y < 45 grados)
+    if abs(angle) > 0.5 and abs(angle) < 45:
+        (h, w) = image.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        corrected = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        return corrected
+        
+    return image
+
+def process_pro_deskew_document(image_bytes: bytes) -> Image.Image:
+    """
+    Aplica enderezado (deskew), mejora de grises equilibrada (CLAHE suave) 
+    y montaje Fill-to-Fit sobre A4.
     """
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -38,45 +72,37 @@ def process_pro_document(image_bytes: bytes) -> Image.Image:
     if img is None:
         raise ValueError("No se pudo decodificar la imagen.")
 
-    # Si la imagen es horizontal (ej. la foto del camión/remolque), la dejamos pasar limpia sin binarizar texto
+    # Si es horizontal (foto de carga), no se endereza ni binariza texto
     if img.shape[1] > img.shape[0]:
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(rgb)
     else:
-        # 1. Escala de grises
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # 1. Enderezar la página automáticamente (Deskew)
+        straight_img = deskew_image(img)
+
+        # 2. Filtro bilateral moderado para limpiar ruido
+        smoothed = cv2.bilateralFilter(straight_img, 9, 50, 50)
+
+        # 3. Contraste equilibrado (CLAHE suave)
+        lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
         
-        # 2. Reducción de ruido avanzada manteniendo bordes de texto
-        denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
-        
-        # 3. Umbral Adaptativo para eliminar sombras del asiento y blanquear el fondo
-        # Esto convierte las sombras oscuras a blanco y deja la tinta ultra nítida
-        thresh = cv2.adaptiveThreshold(
-            denoised, 255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 21, 10
-        )
-        
-        # Convertir a formato RGB de PIL
-        rgb = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+        enhanced = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+        rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
         doc_pil = Image.fromarray(rgb)
 
-    # Dimensiones exactas proporcionales a una hoja A4 a alta resolución (300 DPI aprox: 2480 x 3508 o versión estándar 1650 x 2339)
+    # 4. Fill-to-Fit A4 Proporcional
     target_w, target_h = 1650, 2339 
-    
-    # Calcular escala de "Fill-to-Fit" maximizada
     dw, dh = doc_pil.size
-    ratio = min((target_w - 40) / dw, (target_h - 40) / dh)
+    ratio = min((target_w - 60) / dw, (target_h - 60) / dh)
     new_w = int(dw * ratio)
     new_h = int(dh * ratio)
     
-    # Redimensionar con la máxima calidad de interpolación
     doc_pil = doc_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
     
-    # Crear lienzo A4 100% blanco puro
     canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
-    
-    # Centrar perfectamente el documento escalado
     pos_x = (target_w - new_w) // 2
     pos_y = (target_h - new_h) // 2
     
@@ -104,7 +130,7 @@ async def process_bol(payload: BOLRequest):
                     response.raise_for_status()
                     image_bytes = response.content
 
-                processed_page = process_pro_document(image_bytes)
+                processed_page = process_pro_deskew_document(image_bytes)
                 pil_images.append(processed_page)
             except Exception as img_err:
                 print(f"🚨 [ERROR IMG {index+1}]: {str(img_err)}")
@@ -121,7 +147,7 @@ async def process_bol(payload: BOLRequest):
             format="PDF",
             save_all=True,
             append_images=remaining_images,
-            quality=95,
+            quality=92,
             optimize=True
         )
         
@@ -132,7 +158,7 @@ async def process_bol(payload: BOLRequest):
             "status": "success",
             "total_pages": len(pil_images),
             "pdf_base64": pdf_base64,
-            "message": "PDF optimizado con Fill-to-Fit y binarización de alta nitidez."
+            "message": "PDF optimizado con Enderezado geométrico (Deskew) y Fill-to-Fit A4."
         }
 
     except HTTPException as he:
